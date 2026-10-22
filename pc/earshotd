@@ -11,6 +11,9 @@ Usage: earshotd [run]       run the daemon (default)
 """
 
 import asyncio
+import collections
+import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -22,10 +25,11 @@ import sys
 import time
 from pathlib import Path
 
-PROTO_VERSION = 1
+PROTO_VERSION = 2
 CONTROL_PORT = 10004
 DISCOVERY_PORT = 10005
-DISCOVERY_PROBE = b"EARSHOT?1"
+DISCOVERY_PROBE = b"EARSHOT?2"
+MAX_LINE = 16 * 1024
 NODE_NAME = "earshot.mic"
 NODE_DESCRIPTION = "Earshot"
 
@@ -175,22 +179,31 @@ class Receiver:
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
             self._set_status("up")
             log(f"receiver: started (target latency {self.latency} ms)")
+            tail = collections.deque(maxlen=20)
+            drain = asyncio.create_task(self._drain(self.proc.stderr, tail))
             exited = asyncio.create_task(self.proc.wait())
             restart = asyncio.create_task(self._restart.wait())
             done, _ = await asyncio.wait({exited, restart}, return_when=asyncio.FIRST_COMPLETED)
             if restart in done:
                 self._restart.clear()
                 await self._terminate()
+                drain.cancel()
                 backoff = 0.5
                 continue
             restart.cancel()
-            err = (await self.proc.stderr.read()).decode(errors="replace").strip()
-            log(f"receiver: exited with {self.proc.returncode}: {err[-500:]}")
+            await drain
+            log(f"receiver: exited with {self.proc.returncode}: {' | '.join(tail)[-500:]}")
             self._set_status("down")
             if time.monotonic() - started > 10:
                 backoff = 0.5
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 10)
+
+    @staticmethod
+    async def _drain(stream, tail):
+        # Read stderr as it comes so the child never blocks on a full pipe.
+        async for line in stream:
+            tail.append(line.decode(errors="replace").strip())
 
     async def _terminate(self):
         if self.proc and self.proc.returncode is None:
@@ -214,17 +227,31 @@ class Receiver:
 
 # ---------------------------------------------------------------- daemon
 
+def proof(secret, role, first, second):
+    """HMAC that shows the sender knows the pairing secret, bound to both nonces."""
+    msg = f"earshot/{PROTO_VERSION}/{role}/{first}/{second}".encode()
+    return hmac.new(bytes.fromhex(secret), msg, hashlib.sha256).hexdigest()
+
+
 class Daemon:
     def __init__(self):
         self.state = load_state()
+        if "pc_id" not in self.state:
+            self.update_state(pc_id=secrets.token_hex(8))
         self.mode = self.state.get("mode", DEFAULT_MODE)
         if self.mode not in LATENCY_MS:
             self.mode = DEFAULT_MODE
+        # The daemon owns mute: it survives receiver restarts and is re-applied to a new node.
+        self.want_muted = bool(self.state.get("muted", False))
+        self.mute_seq = 0                # last phone mute request applied (per connection)
         self.receiver = Receiver(self.schedule_refresh)
-        self.client = None            # the connected, paired phone's writer
+        self.client = None               # the connected, authenticated phone's writer
         self.client_prefs = {}
-        self.pc = {"listening": False, "apps": [], "muted": False, "default": False}
-        self._refresh_pending = False
+        self.pc = {"listening": False, "apps": [], "default": False, "node": False}
+        self.node_index = None
+        self._lock = asyncio.Lock()      # refreshes and our own pactl changes never interleave
+        self._dirty = False
+        self._refresh_task = None
         self._revert_task = None
         self.hostname = socket.gethostname()
 
@@ -232,32 +259,58 @@ class Daemon:
         self.state = {**load_state(), **changes}
         save_state(self.state)
 
+    def paired(self):
+        return load_state().get("paired")  # re-read: `earshotd unpair` edits the file
+
     # -- PipeWire observation
 
     def schedule_refresh(self):
-        if not self._refresh_pending:
-            self._refresh_pending = True
-            asyncio.get_running_loop().call_later(0.05, lambda: asyncio.create_task(self.refresh()))
+        self._dirty = True
+        if self._refresh_task is None or self._refresh_task.done():
+            self._refresh_task = asyncio.create_task(self._refresh_loop())
+
+    async def _refresh_loop(self):
+        await asyncio.sleep(0.05)  # coalesce bursts of events
+        while self._dirty:
+            self._dirty = False
+            await self.refresh()
 
     async def refresh(self):
-        self._refresh_pending = False
-        sources = await pactl_json("list", "sources") or []
-        ours = next((s for s in sources if s.get("name") == NODE_NAME), None)
-        default = (await pactl("get-default-source") or "").strip()
-        apps = []
-        if ours is not None:
-            outputs = await pactl_json("list", "source-outputs") or []
-            apps = sorted({app_label(o) for o in outputs
-                           if o.get("source") == ours["index"] and is_real_listener(o)})
-        pc = {
-            "listening": bool(apps),
-            "apps": apps,
-            "muted": bool(ours and ours.get("mute")),
-            "default": default == NODE_NAME,
-        }
-        if pc != self.pc:
+        mute_changed = False
+        async with self._lock:
+            sources = await pactl_json("list", "sources")
+            if sources is None:
+                return  # pipewire-pulse unreachable: keep the last known state
+            ours = next((s for s in sources if s.get("name") == NODE_NAME), None)
+            default = (await pactl("get-default-source") or "").strip()
+            apps = []
+            if ours is not None:
+                if ours["index"] != self.node_index:
+                    # A new node (daemon start or receiver restart): give it our mute and default.
+                    self.node_index = ours["index"]
+                    await self._apply_mute()
+                    if self.client and self.client_prefs.get("default"):
+                        await self._set_default(True)
+                        default = NODE_NAME
+                elif bool(ours.get("mute")) != self.want_muted:
+                    # Same node, mute changed by someone on the PC: follow it and tell the phone.
+                    self.want_muted = bool(ours.get("mute"))
+                    self.update_state(muted=self.want_muted)
+                    mute_changed = True
+                outputs = await pactl_json("list", "source-outputs") or []
+                apps = sorted({app_label(o) for o in outputs
+                               if o.get("source") == ours["index"] and is_real_listener(o)})
+            else:
+                self.node_index = None
+            pc = {"listening": bool(apps), "apps": apps, "default": default == NODE_NAME,
+                  "node": ours is not None}
+            changed = pc != self.pc or mute_changed
             self.pc = pc
+        if changed:
             await self.push_state()
+
+    async def _apply_mute(self):
+        await pactl("set-source-mute", NODE_NAME, "1" if self.want_muted else "0")
 
     async def watch_pipewire(self):
         while True:
@@ -275,7 +328,8 @@ class Daemon:
     # -- control channel
 
     def state_message(self):
-        return {"t": "state", "receiver": self.receiver.status, "mode": self.mode, **self.pc}
+        return {"t": "state", "receiver": self.receiver.status, "mode": self.mode,
+                "muted": self.want_muted, "mute_seq": self.mute_seq, **self.pc}
 
     async def push_state(self):
         if self.client:
@@ -293,31 +347,39 @@ class Daemon:
         sock = writer.get_extra_info("socket")
         if sock is not None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        paired = False
+        device_id = None
         try:
             hello = await asyncio.wait_for(self._read(reader), 10)
             if not hello or hello.get("t") != "hello":
                 return
-            paired = await self._pair(hello, writer)
-            if not paired:
+            device_id = await self._handshake(hello, reader, writer)
+            if not device_id:
                 return
-            log(f"control: {hello.get('name', '?')} connected from {peer[0]}")
+            log(f"control: {str(hello.get('name', '?'))[:64]} connected from {peer[0]}")
             if self.client:  # the same phone reconnecting: newest connection wins
                 self.client.close()
             self.client = writer
+            self.mute_seq = 0
             self._cancel_revert()
-            await self.apply_prefs(hello.get("prefs", {}))
-            await self.refresh()
+            prefs = hello.get("prefs")
+            await self.apply_prefs(prefs if isinstance(prefs, dict) else {})
+            self.schedule_refresh()
             await self.send(writer, self.state_message())
             while True:
                 msg = await asyncio.wait_for(self._read(reader), 30)
                 if msg is None:
                     break
-                await self.on_message(writer, msg)
-        except (asyncio.TimeoutError, ConnectionError, OSError):
-            pass
+                paired = self.paired()
+                if not paired or paired["id"] != device_id:
+                    log("control: pairing revoked, dropping the phone")
+                    await self.send(writer, {"t": "denied", "reason": "not-paired"})
+                    break
+                if not await self.on_message(writer, msg):
+                    break
+        except (asyncio.TimeoutError, ConnectionError, OSError, ValueError):
+            pass  # ValueError: a line over the reader's limit
         finally:
-            if paired and self.client is writer:
+            if device_id and self.client is writer:
                 self.client = None
                 log("control: phone disconnected")
                 self._schedule_revert()
@@ -327,51 +389,84 @@ class Daemon:
         line = await reader.readline()
         if not line:
             return None
-        if len(line) > 64 * 1024:
-            raise ConnectionError("oversized message")
         try:
             msg = json.loads(line)
         except ValueError:
             raise ConnectionError("bad json")
         return msg if isinstance(msg, dict) else None
 
-    async def _pair(self, hello, writer):
-        self.state = load_state()  # `earshotd unpair` may have changed it under us
+    async def _handshake(self, hello, reader, writer):
+        """Pair (on the phone user's explicit request) or prove both sides know the secret.
+
+        Returns the phone's id once trusted, else None. The secret crosses the network
+        only once, at pairing; afterwards each side proves knowledge with an HMAC.
+        """
         device_id = str(hello.get("id", ""))[:64]
         name = str(hello.get("name", "Phone"))[:64]
-        paired = self.state.get("paired")
-        if hello.get("v") != PROTO_VERSION or not device_id:
+        phone_nonce = str(hello.get("nonce", ""))[:64]
+        if hello.get("v") != PROTO_VERSION or not device_id or len(phone_nonce) < 16:
             await self.send(writer, {"t": "denied", "reason": "version"})
-            return False
-        if paired is None:
-            # Trust on first use: the first phone to say hello becomes the paired one.
-            paired = {"id": device_id, "name": name, "secret": secrets.token_hex(16)}
+            return None
+        paired = self.paired()
+        pc_id = self.state["pc_id"]
+
+        if hello.get("pair"):
+            if paired is not None:
+                await self.send(writer, {"t": "denied", "reason": "paired-elsewhere"})
+                return None
+            paired = {"id": device_id, "name": name, "secret": secrets.token_hex(32)}
             self.update_state(paired=paired)
             log(f"pairing: paired with {name}")
-            notify(f"Paired with {name}", "Run `earshotd unpair` to forget it.")
-        elif paired["id"] != device_id or not secrets.compare_digest(
-                str(hello.get("secret", "")), paired["secret"]):
-            await self.send(writer, {"t": "denied", "reason": "paired-elsewhere",
-                                     "host": self.hostname})
-            return False
-        await self.send(writer, {"t": "welcome", "v": PROTO_VERSION, "host": self.hostname,
-                                 "secret": paired["secret"]})
-        return True
+            notify(f"Paired with {name}", "It can now use this PC as its microphone. "
+                   "Run `earshotd unpair` to forget it.")
+            await self.send(writer, {"t": "paired", "pc": pc_id, "host": self.hostname,
+                                     "secret": paired["secret"]})
+            return device_id
+
+        if paired is None or paired["id"] != device_id:
+            await self.send(writer, {"t": "denied", "reason": "not-paired"})
+            return None
+        pc_nonce = secrets.token_hex(16)
+        await self.send(writer, {"t": "challenge", "pc": pc_id, "host": self.hostname, "nonce": pc_nonce,
+                                 "proof": proof(paired["secret"], "pc", phone_nonce, pc_nonce)})
+        answer = await asyncio.wait_for(self._read(reader), 10)
+        expected = proof(paired["secret"], "phone", pc_nonce, phone_nonce)
+        if not answer or answer.get("t") != "auth" or not hmac.compare_digest(
+                str(answer.get("proof", "")), expected):
+            await self.send(writer, {"t": "denied", "reason": "bad-proof"})
+            return None
+        await self.send(writer, {"t": "welcome", "v": PROTO_VERSION, "host": self.hostname})
+        return device_id
 
     async def on_message(self, writer, msg):
+        """Handles one message; False ends the session."""
         kind = msg.get("t")
         if kind == "ping":
             await self.send(writer, {"t": "pong", "n": msg.get("n")})
         elif kind == "set":
             if "muted" in msg:
-                await pactl("set-source-mute", NODE_NAME, "1" if msg["muted"] else "0")
+                async with self._lock:
+                    self.want_muted = bool(msg["muted"])
+                    seq = msg.get("seq")
+                    self.mute_seq = seq if isinstance(seq, int) else self.mute_seq
+                    self.update_state(muted=self.want_muted)
+                    if self.node_index is not None:
+                        await self._apply_mute()
+                await self.push_state()
             await self.apply_prefs(msg)
             self.schedule_refresh()
+        elif kind == "unpair":
+            self.update_state(paired=None)
+            log("pairing: the phone unpaired itself")
+            await self.send(writer, {"t": "unpaired"})
+            return False
+        return True
 
     async def apply_prefs(self, prefs):
         if "default" in prefs:
             self.client_prefs["default"] = bool(prefs["default"])
-            await self.set_default(self.client_prefs["default"])
+            async with self._lock:
+                await self._set_default(self.client_prefs["default"])
         mode = prefs.get("mode")
         if mode in LATENCY_MS and mode != self.mode:
             self.mode = mode
@@ -379,14 +474,16 @@ class Daemon:
             self.receiver.set_latency(LATENCY_MS[mode])
             await self.push_state()
 
-    async def set_default(self, want):
+    async def _set_default(self, want):
+        if self.node_index is None:
+            return  # no node yet; refresh() applies it when the node appears
         current = (await pactl("get-default-source") or "").strip()
         if want and current != NODE_NAME:
             if current:
                 self.update_state(previous_default=current)
             await pactl("set-default-source", NODE_NAME)
         elif not want and current == NODE_NAME:
-            previous = self.state.get("previous_default")
+            previous = load_state().get("previous_default")
             if previous:
                 await pactl("set-default-source", previous)
 
@@ -403,7 +500,8 @@ class Daemon:
     async def _revert_later(self):
         await asyncio.sleep(DEFAULT_REVERT_GRACE_S)
         if self.client is None:
-            await self.set_default(False)
+            async with self._lock:
+                await self._set_default(False)
             self.schedule_refresh()
 
     # -- discovery
@@ -417,9 +515,9 @@ class Daemon:
 
         def datagram_received(self, data, addr):
             if data.strip() == DISCOVERY_PROBE:
-                paired = self.daemon.state.get("paired") or {}
                 reply = {"t": "here", "v": PROTO_VERSION, "host": self.daemon.hostname,
-                         "port": CONTROL_PORT, "paired": paired.get("id")}
+                         "pc": self.daemon.state["pc_id"], "port": CONTROL_PORT,
+                         "pairable": self.daemon.paired() is None}
                 self.transport.sendto(json.dumps(reply).encode(), addr)
 
     # -- lifecycle
@@ -431,7 +529,8 @@ class Daemon:
             loop.add_signal_handler(sig, stop.set)
 
         self.receiver.start(LATENCY_MS[self.mode])
-        server = await asyncio.start_server(self.handle_client, "0.0.0.0", CONTROL_PORT)
+        server = await asyncio.start_server(self.handle_client, "0.0.0.0", CONTROL_PORT,
+                                            limit=MAX_LINE)
         await loop.create_datagram_endpoint(
             lambda: self.Discovery(self), local_addr=("0.0.0.0", DISCOVERY_PORT),
             allow_broadcast=True)
@@ -442,7 +541,8 @@ class Daemon:
         watcher.cancel()
         server.close()
         if self.client_prefs.get("default"):
-            await self.set_default(False)
+            async with self._lock:
+                await self._set_default(False)
         await self.receiver.stop()
 
 
@@ -461,7 +561,6 @@ def main():
         name = (state.pop("paired", None) or {}).get("name")
         save_state(state)
         print(f"Forgot {name}." if name else "No phone was paired.")
-        print("Restart earshotd so a connected phone is dropped.")
     elif cmd == "status":
         state = load_state()
         paired = state.get("paired")

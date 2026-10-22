@@ -4,3 +4,5 @@ tools/*.wav
 tools/*.log
 tools/variant.conf
 pc/*.log
+tools/test-send-android
+tools/proto-daemon.log

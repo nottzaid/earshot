@@ -22,5 +22,7 @@ enum class LatencyMode(
 ) {
     Tight("tight", "Tight", 30, 2500, 6, 3, "Lowest delay, needs a clean signal"),
     Balanced("balanced", "Balanced", 50, 2500, 10, 5, "Low delay, rides out Wi-Fi hiccups"),
-    Steady("steady", "Steady", 100, 5000, 16, 8, "For crowded or distant Wi-Fi"),
+    // The FEC block (source packets x packet length) stays at or under half the PC's target,
+    // so repair packets arrive while they can still help.
+    Steady("steady", "Steady", 100, 5000, 10, 6, "For crowded or distant Wi-Fi"),
 }

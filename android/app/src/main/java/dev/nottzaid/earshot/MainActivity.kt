@@ -30,6 +30,7 @@ import dev.nottzaid.earshot.audio.EngineStatus
 import dev.nottzaid.earshot.audio.Mics
 import dev.nottzaid.earshot.audio.NativeEngine
 import dev.nottzaid.earshot.data.Prefs
+import dev.nottzaid.earshot.net.FoundPc
 import dev.nottzaid.earshot.service.Earshot
 import dev.nottzaid.earshot.service.MicService
 import dev.nottzaid.earshot.service.Phase
@@ -136,6 +137,7 @@ private fun App() {
         onGainPreview = { NativeEngine.setGainDb(it) },
         onGainCommit = { scope.launch { settings.setGain(it) } },
         onOpenSettings = { showSettings = true },
+        onPair = { MicService.pair(context, it.id) },
     )
 
     if (showSettings) {
@@ -148,6 +150,10 @@ private fun App() {
             onSmartStandby = { scope.launch { settings.setSmartStandby(it) } },
             onRumble = { scope.launch { settings.setRumble(it) } },
             onDefaultMic = { scope.launch { settings.setDefaultMic(it) } },
+            onForget = {
+                // Running: the service tells the PC to forget us too. Off: only this phone forgets.
+                if (runtime.phase != Phase.Off) MicService.forget(context) else scope.launch { settings.forgetPc() }
+            },
         )
     }
 }
@@ -177,36 +183,52 @@ private fun describe(rt: Runtime, p: Prefs, micDenied: Boolean): MainUi {
     val pill = when {
         rt.phase == Phase.Off -> rt.pcName ?: "Not connected"
         rt.connected -> rt.rttMs?.let { "$pc · ${"%.0f".format(it)} ms" } ?: pc
+        rt.problem == Problem.NeedsPairing -> "Not paired"
         else -> "Searching"
     }
     val dot = when {
         rt.phase == Phase.Off -> PillDot.Off
         rt.connected -> PillDot.Connected
-        rt.problem == Problem.PairedElsewhere -> PillDot.Problem
+        rt.problem == Problem.Unverified || rt.problem == Problem.NoWifi -> PillDot.Problem
         else -> PillDot.Searching
     }
-    fun ui(look: OrbLook, title: String, detail: String, orbLabel: String) =
-        MainUi(look, title, detail, pill, dot, rt.phase != Phase.Off, orbLabel)
+    val muteLabel = if (p.muted) "Unmute" else "Mute"
+    fun ui(look: OrbLook, title: String, detail: String, orbLabel: String = muteLabel, pairable: List<FoundPc> = emptyList()) =
+        MainUi(look, title, detail, pill, dot, rt.phase != Phase.Off, orbLabel, pairable)
+    // Muted overrides the orb everywhere the mic could be open, so it never looks live when it isn't.
+    fun quiet(look: OrbLook) = if (p.muted) OrbLook.Muted else look
 
     return when {
         rt.phase == Phase.Off && micDenied ->
             ui(OrbLook.Off, "Mic access needed", "Earshot can't hear anything without it. Tap to allow.", "Allow microphone")
         rt.phase == Phase.Off -> ui(OrbLook.Off, "Off", "Tap to stream this phone's mic to $pc", "Start")
         rt.problem == Problem.MicUnavailable ->
-            ui(OrbLook.Problem, "Mic unavailable", "Another app is holding the microphone. Retrying…", "Mute")
+            ui(OrbLook.Problem, "Mic unavailable", "Another app is holding the microphone. Retrying…")
+        rt.problem == Problem.NoWifi && !rt.connected ->
+            ui(quiet(OrbLook.Searching), "No Wi-Fi", "Earshot only streams over Wi-Fi. Connect to the same network as $pc.")
         rt.phase == Phase.Live && p.muted ->
-            ui(OrbLook.Muted, "Muted", if (rt.connected) "Nothing reaches $pc until you unmute" else "Reconnecting to $pc…", "Unmute")
+            ui(OrbLook.Muted, "Muted", if (rt.connected) "Nothing reaches $pc until you unmute" else "Reconnecting to $pc…")
         rt.phase == Phase.Live ->
             ui(OrbLook.Live, "Live", when {
                 !rt.connected -> "Streaming · reconnecting to $pc…"
                 listeners != null -> listeners
                 else -> "Streaming to $pc · no app is listening"
-            }, "Mute")
+            })
         rt.phase == Phase.Standby ->
-            ui(if (p.muted) OrbLook.Muted else OrbLook.Standby, if (p.muted) "Muted" else "Standby",
-                "Opens as soon as an app on $pc uses the mic", if (p.muted) "Unmute" else "Mute")
-        rt.problem == Problem.PairedElsewhere ->
-            ui(OrbLook.Searching, "Paired elsewhere", "$pc trusts another phone. Run earshotd unpair on it to switch.", "Mute")
-        else -> ui(OrbLook.Searching, "Searching", "Looking for $pc on this Wi-Fi. Is earshotd running?", "Mute")
+            ui(quiet(OrbLook.Standby), if (p.muted) "Muted" else "Standby", "Opens as soon as an app on $pc uses the mic")
+        rt.problem == Problem.NeedsPairing -> {
+            val free = rt.found.filter { it.pairable }
+            when {
+                free.isNotEmpty() -> ui(quiet(OrbLook.Searching), "Pair with your PC", "Choose the PC this phone should be a mic for.", pairable = free)
+                rt.found.isNotEmpty() -> ui(quiet(OrbLook.Searching), "Already paired",
+                    "${rt.found.first().name} trusts another phone. Run earshotd unpair on it to switch.")
+                else -> ui(quiet(OrbLook.Searching), "Looking for PCs", "Start earshotd on your PC, on this Wi-Fi.")
+            }
+        }
+        rt.problem == Problem.PcTaken ->
+            ui(quiet(OrbLook.Searching), "Already paired", "That PC trusts another phone. Run earshotd unpair on it to switch.")
+        rt.problem == Problem.Unverified ->
+            ui(OrbLook.Problem, "Can't verify $pc", "Something answered as $pc but couldn't prove it. Not connecting.")
+        else -> ui(quiet(OrbLook.Searching), "Searching", "Looking for $pc on this Wi-Fi. Is earshotd running?")
     }
 }

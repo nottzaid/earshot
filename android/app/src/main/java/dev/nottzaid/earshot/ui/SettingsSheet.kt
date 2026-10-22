@@ -18,6 +18,10 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import dev.nottzaid.earshot.audio.LatencyMode
 import dev.nottzaid.earshot.data.Prefs
@@ -45,6 +49,7 @@ fun SettingsSheet(
     onSmartStandby: (Boolean) -> Unit,
     onRumble: (Boolean) -> Unit,
     onDefaultMic: (Boolean) -> Unit,
+    onForget: () -> Unit,
 ) {
     val p = LocalPalette.current
     ModalBottomSheet(
@@ -66,7 +71,7 @@ fun SettingsSheet(
             Spacer(Modifier.height(14.dp))
 
             SectionLabel("Latency") {
-                Text("≈ ${prefs.latency.targetMs} ms", style = MaterialTheme.typography.labelMedium, color = p.text)
+                Text("${prefs.latency.targetMs} ms buffer", style = MaterialTheme.typography.labelMedium, color = p.text)
             }
             Spacer(Modifier.height(4.dp))
             Segmented(LatencyMode.entries, prefs.latency, { it.title }, onLatency)
@@ -113,6 +118,23 @@ fun SettingsSheet(
                 tabular,
             )
             if (diagnostics.overruns > 0) Fact("Dropped bursts", diagnostics.overruns.toString(), tabular)
+            if (prefs.paired) {
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    "Forget ${prefs.pcName ?: "this PC"}",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = p.danger,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable(role = Role.Button, onClick = onForget)
+                        .padding(horizontal = 4.dp, vertical = 14.dp),
+                )
+                Text(
+                    if (runtime.connected) "The PC forgets this phone too, and you can pair again."
+                    else "If the PC is away, also run earshotd unpair on it before pairing again.",
+                    style = MaterialTheme.typography.bodySmall, color = p.textMuted, modifier = Modifier.padding(start = 4.dp),
+                )
+            }
         }
     }
 }

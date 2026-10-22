@@ -112,6 +112,9 @@ public:
 
     bool start(const Config& cfg) {
         stop();
+        state = 0;
+        overruns = 0;
+        streamDied_ = false;  // a late error callback from the previous stream must not hit the new one
         cfg_ = cfg;
         cfg_.link.host = cfg_.host.c_str();
         link_ = es_link_open(&cfg_.link);
@@ -146,7 +149,7 @@ public:
         meterPeak = 0;
         meterRms = 0;
         receivers = 0;
-        if (state > 0) state = 0;
+        state = 0;
     }
 
     Engine() { sem_init(&ready_, 0, 0); }
@@ -185,6 +188,14 @@ private:
         oboe::Result r = b.openStream(stream_);
         if (r != oboe::Result::OK) {
             LOGW("openStream failed: %s", oboe::convertToText(r));
+            return false;
+        }
+        if (stream_->getFormat() != oboe::AudioFormat::Float || stream_->getChannelCount() != 1 ||
+            stream_->getSampleRate() != kRate) {
+            // Oboe converts when asked for these; anything else would be misread by the DSP and ROC.
+            LOGW("input stream came back as format=%d channels=%d rate=%d", int(stream_->getFormat()),
+                 stream_->getChannelCount(), stream_->getSampleRate());
+            closeStream();
             return false;
         }
         mmap = oboe::OboeExtensions::isMMapUsed(stream_.get());
@@ -233,13 +244,14 @@ private:
 
         while (running_) {
             timespec deadline;
-            clock_gettime(CLOCK_REALTIME, &deadline);
+            clock_gettime(CLOCK_MONOTONIC, &deadline);
             deadline.tv_nsec += 100 * 1000000;
             if (deadline.tv_nsec >= 1000000000) {
                 deadline.tv_sec++;
                 deadline.tv_nsec -= 1000000000;
             }
-            if (sem_timedwait(&ready_, &deadline) != 0 && errno != ETIMEDOUT) continue;
+            // Monotonic, so a wall-clock change can't stall the stream.
+            if (sem_timedwait_monotonic_np(&ready_, &deadline) != 0 && errno != ETIMEDOUT) continue;
             if (!running_) break;
 
             if (streamDied_.exchange(false)) {

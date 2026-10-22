@@ -58,6 +58,10 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import dev.nottzaid.earshot.audio.Mic
+import dev.nottzaid.earshot.net.FoundPc
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import dev.nottzaid.earshot.audio.SoundMode
 import dev.nottzaid.earshot.data.Prefs
 import kotlin.math.abs
@@ -72,6 +76,8 @@ data class MainUi(
     val pillDot: PillDot,
     val running: Boolean,
     val orbLabel: String,
+    /** PCs the user can pair with right now; shown in place of the Stop button. */
+    val pairable: List<FoundPc> = emptyList(),
 )
 
 enum class PillDot { Off, Searching, Connected, Problem }
@@ -96,6 +102,7 @@ fun MainScreen(
     onGainPreview: (Float) -> Unit,
     onGainCommit: (Float) -> Unit,
     onOpenSettings: () -> Unit,
+    onPair: (FoundPc) -> Unit,
 ) {
     val p = LocalPalette.current
     val ambient by animateColorAsState(
@@ -153,7 +160,7 @@ fun MainScreen(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp), minLines = 2, maxLines = 2,
                 )
             }
-            StopSlot(ui.running, onStop)
+            if (ui.pairable.isNotEmpty()) PairChoices(ui.pairable, onPair) else StopSlot(ui.running, onStop)
             Spacer(Modifier.weight(1f))
             ControlsCard(prefs, mics, meters, onMic, onSound, onGainPreview, onGainCommit)
             Spacer(Modifier.height(16.dp))
@@ -195,14 +202,36 @@ private fun StopSlot(visible: Boolean, onStop: () -> Unit) {
 @Composable
 private fun StopButton(onStop: () -> Unit) {
     val p = LocalPalette.current
-    Box(
-        Modifier
-            .clip(CircleShape)
-            .border(1.dp, p.outline, CircleShape)
-            .clickable(onClick = onStop)
-            .padding(horizontal = 18.dp, vertical = 8.dp),
-    ) {
-        Text("Stop", style = MaterialTheme.typography.labelLarge, color = p.textMuted)
+    // 48 dp tall touch target around a quieter visible pill.
+    Box(Modifier.height(48.dp).clickable(role = Role.Button, onClick = onStop), contentAlignment = Alignment.Center) {
+        Box(
+            Modifier
+                .clip(CircleShape)
+                .border(1.dp, p.outline, CircleShape)
+                .padding(horizontal = 18.dp, vertical = 8.dp),
+        ) {
+            Text("Stop", style = MaterialTheme.typography.labelLarge, color = p.textMuted)
+        }
+    }
+}
+
+@Composable
+private fun PairChoices(pcs: List<FoundPc>, onPair: (FoundPc) -> Unit) {
+    val p = LocalPalette.current
+    Row(Modifier.height(56.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+        pcs.take(3).forEach { pc ->
+            Box(
+                Modifier
+                    .height(44.dp)
+                    .clip(CircleShape)
+                    .background(p.accent)
+                    .clickable(role = Role.Button) { onPair(pc) }
+                    .padding(horizontal = 20.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("Pair with ${pc.name}", style = MaterialTheme.typography.labelLarge, color = Color.White, maxLines = 1)
+            }
+        }
     }
 }
 
@@ -268,7 +297,10 @@ private fun ControlsCard(
                 activeTickColor = Color.Transparent,
                 inactiveTickColor = Color.Transparent,
             ),
-            modifier = Modifier.fillMaxWidth().height(32.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(32.dp)
+                .semantics { stateDescription = "Gain ${formatDb(gain)}" },
         )
     }
 }

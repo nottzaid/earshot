@@ -25,10 +25,13 @@ data class Prefs(
     val defaultMic: Boolean = true,
     val muted: Boolean = false,
     val deviceId: String = "",
-    val pcHost: String? = null,      // last PC address that answered
+    val pcHost: String? = null,      // last address of the paired PC (a hint; identity is pcId)
+    val pcId: String? = null,        // the paired PC's stable id
     val pcName: String? = null,
-    val pcSecret: String? = null,    // pairing secret issued by that PC
-)
+    val pcSecret: String? = null,    // pairing secret shared with that PC
+) {
+    val paired get() = pcId != null && pcSecret != null
+}
 
 class Settings(private val context: Context) {
     private object K {
@@ -42,6 +45,7 @@ class Settings(private val context: Context) {
         val muted = booleanPreferencesKey("muted")
         val deviceId = stringPreferencesKey("device_id")
         val pcHost = stringPreferencesKey("pc_host")
+        val pcId = stringPreferencesKey("pc_id")
         val pcName = stringPreferencesKey("pc_name")
         val pcSecret = stringPreferencesKey("pc_secret")
     }
@@ -59,6 +63,7 @@ class Settings(private val context: Context) {
         muted = this[K.muted] ?: false,
         deviceId = this[K.deviceId].orEmpty(),
         pcHost = this[K.pcHost],
+        pcId = this[K.pcId],
         pcName = this[K.pcName],
         pcSecret = this[K.pcSecret],
     )
@@ -81,14 +86,16 @@ class Settings(private val context: Context) {
     suspend fun setDefaultMic(on: Boolean) = context.store.edit { it[K.defaultMic] = on }
     suspend fun setMuted(on: Boolean) = context.store.edit { it[K.muted] = on }
 
-    suspend fun rememberPc(host: String, name: String, secret: String) = context.store.edit {
+    suspend fun rememberPc(host: String, id: String, name: String, secret: String?) = context.store.edit {
         it[K.pcHost] = host
+        it[K.pcId] = id
         it[K.pcName] = name
-        it[K.pcSecret] = secret
+        if (secret != null) it[K.pcSecret] = secret
     }
 
     suspend fun forgetPc() = context.store.edit {
         it.remove(K.pcHost)
+        it.remove(K.pcId)
         it.remove(K.pcName)
         it.remove(K.pcSecret)
     }

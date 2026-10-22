@@ -7,6 +7,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef __ANDROID__
+#include <android/log.h>
+
+// Roc logs to stderr by default, which Android discards.
+static void log_to_logcat(const roc_log_message* msg, void* arg) {
+    (void)arg;
+    __android_log_print(msg->level == ROC_LOG_ERROR ? ANDROID_LOG_ERROR : ANDROID_LOG_INFO, "earshot-roc",
+                        "%s: %s", msg->module, msg->text);
+}
+#endif
+
 struct es_link {
     roc_context* context;
     roc_sender* sender;
@@ -30,6 +41,9 @@ es_link* es_link_open(const es_link_params* p) {
         return NULL;
 
     roc_log_set_level(ROC_LOG_ERROR);
+#ifdef __ANDROID__
+    roc_log_set_handler(log_to_logcat, NULL);
+#endif
 
     roc_context_config ctx_cfg;
     memset(&ctx_cfg, 0, sizeof(ctx_cfg));

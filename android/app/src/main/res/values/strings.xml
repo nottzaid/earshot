@@ -14,13 +14,14 @@
     <string name="status_mic_busy">Mic unavailable</string>
     <string name="status_mic_busy_detail">Another app is holding the microphone</string>
 
-    <string name="detail_off">Tap to start</string>
-    <string name="detail_to">Streaming to %1$s</string>
+    <string name="detail_muted">Nothing reaches %1$s until you unmute</string>
+    <string name="detail_reconnecting">Streaming · reconnecting to %1$s</string>
     <string name="detail_nobody">Streaming to %1$s · no app is listening</string>
     <string name="detail_one">%1$s is listening</string>
     <string name="detail_two">%1$s and %2$s are listening</string>
     <string name="detail_many">%1$s and %2$d more are listening</string>
     <string name="detail_standby">Opens when an app on %1$s listens</string>
     <string name="detail_searching">Looking for your PC on this Wi-Fi</string>
-    <string name="detail_paired_elsewhere">%1$s is paired with another phone</string>
+    <string name="status_pair">Pair with your PC</string>
+    <string name="detail_pair">Open Earshot to choose a PC</string>
 </resources>

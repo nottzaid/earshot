@@ -13,9 +13,6 @@ import dev.nottzaid.earshot.R
 import dev.nottzaid.earshot.service.Earshot
 import dev.nottzaid.earshot.service.MicService
 import dev.nottzaid.earshot.service.Phase
-import dev.nottzaid.earshot.settings
-import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.runBlocking
 
 /** Quick Settings: mute/unmute while running; opens the app when off (a mic service can't start from the shade). */
 class MicTile : TileService() {
@@ -39,14 +36,10 @@ class MicTile : TileService() {
     private fun render() {
         val tile = qsTile ?: return
         val rt = Earshot.runtime.value
-        // Tile callbacks are rare and the store is in memory after first read.
-        val muted = runBlocking { settings.prefs.first().muted }
+        val muted = rt.muted
         val live = rt.phase != Phase.Off
-        tile.state = when {
-            !live -> Tile.STATE_INACTIVE
-            muted -> Tile.STATE_INACTIVE
-            else -> Tile.STATE_ACTIVE
-        }
+        // Active means "this phone is your PC's mic right now", not merely "the service is running".
+        tile.state = if ((rt.phase == Phase.Live || rt.phase == Phase.Standby) && !muted) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
         tile.icon = Icon.createWithResource(this, if (live && muted) R.drawable.ic_stat_muted else R.drawable.ic_stat_mic)
         tile.label = getString(R.string.app_name)
         tile.subtitle = MicService.describe(this, rt, muted).first

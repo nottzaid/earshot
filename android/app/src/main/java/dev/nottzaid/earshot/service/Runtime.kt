@@ -18,12 +18,27 @@ enum class Phase {
     Live,
 }
 
-enum class Problem { None, NoPc, PairedElsewhere, MicUnavailable, NetworkUnavailable }
+enum class Problem {
+    None,
+    /** No paired PC answered (or nothing answered at all). */
+    NoPc,
+    /** Not paired yet: the user picks a PC from [Runtime.found]. */
+    NeedsPairing,
+    /** The PC we tried to pair with already trusts another phone. */
+    PcTaken,
+    /** A PC claiming to be ours could not prove it holds the pairing secret. */
+    Unverified,
+    MicUnavailable,
+    NoWifi,
+}
 
 data class Runtime(
     val phase: Phase = Phase.Off,
     val problem: Problem = Problem.None,
     val pc: FoundPc? = null,
+    /** PCs on the network, for pairing. */
+    val found: List<FoundPc> = emptyList(),
+    val muted: Boolean = false,
     val pcName: String? = null,
     val connected: Boolean = false,
     val pcState: PcState = PcState(),
