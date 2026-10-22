@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""Earshot PC daemon.
+
+Runs the ROC receiver that turns the phone's stream into a PipeWire mic, answers
+discovery probes, and keeps a control channel with the paired phone: who is
+listening, mute, default-mic and latency mode.
+
+Usage: earshotd [run]       run the daemon (default)
+       earshotd unpair      forget the paired phone
+       earshotd status      print the paired phone and receiver settings
+"""
+
+import asyncio
+import json
+import os
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PROTO_VERSION = 1
+CONTROL_PORT = 10004
+DISCOVERY_PORT = 10005
+DISCOVERY_PROBE = b"EARSHOT?1"
+NODE_NAME = "earshot.mic"
+NODE_DESCRIPTION = "Earshot"
+
+# Receiver-side half of each latency mode; the phone owns the packet/FEC half.
+LATENCY_MS = {"tight": 30, "balanced": 50, "steady": 100}
+DEFAULT_MODE = "balanced"
+
+# Graceful fallback when the phone vanishes: keep the default mic for a moment
+# so a Wi-Fi blip doesn't bounce every app to another mic and back.
+DEFAULT_REVERT_GRACE_S = 4.0
+
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "earshot"
+STATE_FILE = STATE_DIR / "state.json"
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "earshot"
+
+RECEIVER_CONF = """\
+context.properties = {{ core.daemon = false  log.level = 2 }}
+context.spa-libs = {{
+    audio.convert.* = audioconvert/libspa-audioconvert
+    support.*       = support/libspa-support
+}}
+context.modules = [
+    {{ name = libpipewire-module-rt  args = {{ nice.level = -11 rt.prio = 88 }}  flags = [ ifexists nofail ] }}
+    {{ name = libpipewire-module-protocol-native }}
+    {{ name = libpipewire-module-client-node }}
+    {{ name = libpipewire-module-adapter }}
+    {{ name = libpipewire-module-roc-source
+        args = {{
+            local.ip = 0.0.0.0
+            local.source.port = 10001
+            local.repair.port = 10002
+            local.control.port = 10003
+            fec.code = rs8m
+            sess.latency.msec = {latency}
+            # speex: unity gain and clean output; the builtin resampler measured +1 dB.
+            roc.resampler.backend = speex
+            roc.resampler.profile = high
+            # gradual: drift correction without the audible steps of 'responsive'.
+            roc.latency-tuner.profile = gradual
+            audio.position = [ MONO ]
+            source.name = {node}
+            source.props = {{
+                node.name = {node}
+                node.description = "{description}"
+                media.class = Audio/Source
+                audio.rate = 48000
+                node.latency = 256/48000
+                device.icon-name = phone
+                # never become the default mic on its own; only when the phone asks
+                priority.session = 100
+                priority.driver = 100
+            }}
+        }}
+    }}
+]
+"""
+
+
+def log(*args):
+    print(*args, file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------- persisted state
+
+def load_state():
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.chmod(0o600)
+    tmp.replace(STATE_FILE)
+
+
+# ---------------------------------------------------------------- pactl helpers
+
+async def pactl(*args):
+    proc = await asyncio.create_subprocess_exec(
+        "pactl", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    out, _ = await proc.communicate()
+    return out.decode() if proc.returncode == 0 else None
+
+
+async def pactl_json(*args):
+    out = await pactl("-f", "json", *args)
+    try:
+        return json.loads(out) if out else None
+    except ValueError:
+        return None
+
+
+def is_real_listener(output):
+    """A source-output that is an app actually recording, not a level meter."""
+    p = output.get("properties", {})
+    if output.get("corked"):
+        return False
+    if p.get("stream.monitor") == "true" or p.get("node.passive") == "true":
+        return False
+    if p.get("media.name", "").lower() in ("peak detect", "peak detection"):
+        return False
+    return True
+
+
+def app_label(output):
+    p = output.get("properties", {})
+    return (p.get("application.name") or p.get("application.process.binary")
+            or p.get("node.name") or "An app")
+
+
+# ---------------------------------------------------------------- receiver
+
+class Receiver:
+    """Owns the `pipewire -c receiver.conf` child that hosts the ROC source node."""
+
+    def __init__(self, on_change):
+        self.latency = LATENCY_MS[DEFAULT_MODE]
+        self.proc = None
+        self.status = "down"
+        self._on_change = on_change
+        self._task = None
+        self._restart = asyncio.Event()
+
+    def start(self, latency):
+        self.latency = latency
+        self._task = asyncio.create_task(self._supervise())
+
+    def set_latency(self, latency):
+        if latency != self.latency:
+            self.latency = latency
+            self._restart.set()
+
+    async def _supervise(self):
+        backoff = 0.5
+        while True:
+            RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+            conf = RUNTIME_DIR / "receiver.conf"
+            conf.write_text(RECEIVER_CONF.format(
+                latency=self.latency, node=NODE_NAME, description=NODE_DESCRIPTION))
+            started = time.monotonic()
+            self.proc = await asyncio.create_subprocess_exec(
+                "pipewire", "-c", str(conf),
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+            self._set_status("up")
+            log(f"receiver: started (target latency {self.latency} ms)")
+            exited = asyncio.create_task(self.proc.wait())
+            restart = asyncio.create_task(self._restart.wait())
+            done, _ = await asyncio.wait({exited, restart}, return_when=asyncio.FIRST_COMPLETED)
+            if restart in done:
+                self._restart.clear()
+                await self._terminate()
+                backoff = 0.5
+                continue
+            restart.cancel()
+            err = (await self.proc.stderr.read()).decode(errors="replace").strip()
+            log(f"receiver: exited with {self.proc.returncode}: {err[-500:]}")
+            self._set_status("down")
+            if time.monotonic() - started > 10:
+                backoff = 0.5
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 10)
+
+    async def _terminate(self):
+        if self.proc and self.proc.returncode is None:
+            self.proc.terminate()
+            try:
+                await asyncio.wait_for(self.proc.wait(), 3)
+            except asyncio.TimeoutError:
+                self.proc.kill()
+                await self.proc.wait()
+
+    def _set_status(self, status):
+        if status != self.status:
+            self.status = status
+            self._on_change()
+
+    async def stop(self):
+        if self._task:
+            self._task.cancel()
+        await self._terminate()
+
+
+# ---------------------------------------------------------------- daemon
+
+class Daemon:
+    def __init__(self):
+        self.state = load_state()
+        self.mode = self.state.get("mode", DEFAULT_MODE)
+        if self.mode not in LATENCY_MS:
+            self.mode = DEFAULT_MODE
+        self.receiver = Receiver(self.schedule_refresh)
+        self.client = None            # the connected, paired phone's writer
+        self.client_prefs = {}
+        self.pc = {"listening": False, "apps": [], "muted": False, "default": False}
+        self._refresh_pending = False
+        self._revert_task = None
+        self.hostname = socket.gethostname()
+
+    def update_state(self, **changes):
+        self.state = {**load_state(), **changes}
+        save_state(self.state)
+
+    # -- PipeWire observation
+
+    def schedule_refresh(self):
+        if not self._refresh_pending:
+            self._refresh_pending = True
+            asyncio.get_running_loop().call_later(0.05, lambda: asyncio.create_task(self.refresh()))
+
+    async def refresh(self):
+        self._refresh_pending = False
+        sources = await pactl_json("list", "sources") or []
+        ours = next((s for s in sources if s.get("name") == NODE_NAME), None)
+        default = (await pactl("get-default-source") or "").strip()
+        apps = []
+        if ours is not None:
+            outputs = await pactl_json("list", "source-outputs") or []
+            apps = sorted({app_label(o) for o in outputs
+                           if o.get("source") == ours["index"] and is_real_listener(o)})
+        pc = {
+            "listening": bool(apps),
+            "apps": apps,
+            "muted": bool(ours and ours.get("mute")),
+            "default": default == NODE_NAME,
+        }
+        if pc != self.pc:
+            self.pc = pc
+            await self.push_state()
+
+    async def watch_pipewire(self):
+        while True:
+            proc = await asyncio.create_subprocess_exec(
+                "pactl", "subscribe", stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL)
+            self.schedule_refresh()
+            async for line in proc.stdout:
+                text = line.decode(errors="replace")
+                if "source" in text or "server" in text:
+                    self.schedule_refresh()
+            await proc.wait()
+            await asyncio.sleep(1)
+
+    # -- control channel
+
+    def state_message(self):
+        return {"t": "state", "receiver": self.receiver.status, "mode": self.mode, **self.pc}
+
+    async def push_state(self):
+        if self.client:
+            await self.send(self.client, self.state_message())
+
+    async def send(self, writer, msg):
+        try:
+            writer.write((json.dumps(msg) + "\n").encode())
+            await writer.drain()
+        except (ConnectionError, OSError):
+            pass
+
+    async def handle_client(self, reader, writer):
+        peer = writer.get_extra_info("peername")
+        sock = writer.get_extra_info("socket")
+        if sock is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        paired = False
+        try:
+            hello = await asyncio.wait_for(self._read(reader), 10)
+            if not hello or hello.get("t") != "hello":
+                return
+            paired = await self._pair(hello, writer)
+            if not paired:
+                return
+            log(f"control: {hello.get('name', '?')} connected from {peer[0]}")
+            if self.client:  # the same phone reconnecting: newest connection wins
+                self.client.close()
+            self.client = writer
+            self._cancel_revert()
+            await self.apply_prefs(hello.get("prefs", {}))
+            await self.refresh()
+            await self.send(writer, self.state_message())
+            while True:
+                msg = await asyncio.wait_for(self._read(reader), 30)
+                if msg is None:
+                    break
+                await self.on_message(writer, msg)
+        except (asyncio.TimeoutError, ConnectionError, OSError):
+            pass
+        finally:
+            if paired and self.client is writer:
+                self.client = None
+                log("control: phone disconnected")
+                self._schedule_revert()
+            writer.close()
+
+    async def _read(self, reader):
+        line = await reader.readline()
+        if not line:
+            return None
+        if len(line) > 64 * 1024:
+            raise ConnectionError("oversized message")
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            raise ConnectionError("bad json")
+        return msg if isinstance(msg, dict) else None
+
+    async def _pair(self, hello, writer):
+        self.state = load_state()  # `earshotd unpair` may have changed it under us
+        device_id = str(hello.get("id", ""))[:64]
+        name = str(hello.get("name", "Phone"))[:64]
+        paired = self.state.get("paired")
+        if hello.get("v") != PROTO_VERSION or not device_id:
+            await self.send(writer, {"t": "denied", "reason": "version"})
+            return False
+        if paired is None:
+            # Trust on first use: the first phone to say hello becomes the paired one.
+            paired = {"id": device_id, "name": name, "secret": secrets.token_hex(16)}
+            self.update_state(paired=paired)
+            log(f"pairing: paired with {name}")
+            notify(f"Paired with {name}", "Run `earshotd unpair` to forget it.")
+        elif paired["id"] != device_id or not secrets.compare_digest(
+                str(hello.get("secret", "")), paired["secret"]):
+            await self.send(writer, {"t": "denied", "reason": "paired-elsewhere",
+                                     "host": self.hostname})
+            return False
+        await self.send(writer, {"t": "welcome", "v": PROTO_VERSION, "host": self.hostname,
+                                 "secret": paired["secret"]})
+        return True
+
+    async def on_message(self, writer, msg):
+        kind = msg.get("t")
+        if kind == "ping":
+            await self.send(writer, {"t": "pong", "n": msg.get("n")})
+        elif kind == "set":
+            if "muted" in msg:
+                await pactl("set-source-mute", NODE_NAME, "1" if msg["muted"] else "0")
+            await self.apply_prefs(msg)
+            self.schedule_refresh()
+
+    async def apply_prefs(self, prefs):
+        if "default" in prefs:
+            self.client_prefs["default"] = bool(prefs["default"])
+            await self.set_default(self.client_prefs["default"])
+        mode = prefs.get("mode")
+        if mode in LATENCY_MS and mode != self.mode:
+            self.mode = mode
+            self.update_state(mode=mode)
+            self.receiver.set_latency(LATENCY_MS[mode])
+            await self.push_state()
+
+    async def set_default(self, want):
+        current = (await pactl("get-default-source") or "").strip()
+        if want and current != NODE_NAME:
+            if current:
+                self.update_state(previous_default=current)
+            await pactl("set-default-source", NODE_NAME)
+        elif not want and current == NODE_NAME:
+            previous = self.state.get("previous_default")
+            if previous:
+                await pactl("set-default-source", previous)
+
+    def _schedule_revert(self):
+        if self.client_prefs.get("default"):
+            self._cancel_revert()
+            self._revert_task = asyncio.create_task(self._revert_later())
+
+    def _cancel_revert(self):
+        if self._revert_task:
+            self._revert_task.cancel()
+            self._revert_task = None
+
+    async def _revert_later(self):
+        await asyncio.sleep(DEFAULT_REVERT_GRACE_S)
+        if self.client is None:
+            await self.set_default(False)
+            self.schedule_refresh()
+
+    # -- discovery
+
+    class Discovery(asyncio.DatagramProtocol):
+        def __init__(self, daemon):
+            self.daemon = daemon
+
+        def connection_made(self, transport):
+            self.transport = transport
+
+        def datagram_received(self, data, addr):
+            if data.strip() == DISCOVERY_PROBE:
+                paired = self.daemon.state.get("paired") or {}
+                reply = {"t": "here", "v": PROTO_VERSION, "host": self.daemon.hostname,
+                         "port": CONTROL_PORT, "paired": paired.get("id")}
+                self.transport.sendto(json.dumps(reply).encode(), addr)
+
+    # -- lifecycle
+
+    async def run(self):
+        loop = asyncio.get_running_loop()
+        stop = asyncio.Event()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop.set)
+
+        self.receiver.start(LATENCY_MS[self.mode])
+        server = await asyncio.start_server(self.handle_client, "0.0.0.0", CONTROL_PORT)
+        await loop.create_datagram_endpoint(
+            lambda: self.Discovery(self), local_addr=("0.0.0.0", DISCOVERY_PORT),
+            allow_broadcast=True)
+        watcher = asyncio.create_task(self.watch_pipewire())
+        log(f"earshotd: control on :{CONTROL_PORT}, discovery on :{DISCOVERY_PORT}/udp")
+
+        await stop.wait()
+        watcher.cancel()
+        server.close()
+        if self.client_prefs.get("default"):
+            await self.set_default(False)
+        await self.receiver.stop()
+
+
+def notify(title, body):
+    if shutil.which("notify-send"):
+        subprocess.Popen(["notify-send", "-a", "Earshot", "-i", "phone", title, body],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
+    if cmd == "run":
+        asyncio.run(Daemon().run())
+    elif cmd == "unpair":
+        state = load_state()
+        name = (state.pop("paired", None) or {}).get("name")
+        save_state(state)
+        print(f"Forgot {name}." if name else "No phone was paired.")
+        print("Restart earshotd so a connected phone is dropped.")
+    elif cmd == "status":
+        state = load_state()
+        paired = state.get("paired")
+        print(f"paired: {paired['name'] if paired else 'none'}")
+        print(f"mode: {state.get('mode', DEFAULT_MODE)}")
+    else:
+        print(__doc__.strip())
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

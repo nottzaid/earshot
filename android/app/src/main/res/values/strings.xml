@@ -1,0 +1,26 @@
+<resources>
+    <string name="app_name">Earshot</string>
+    <string name="channel_mic">Microphone</string>
+    <string name="your_pc">your PC</string>
+    <string name="mute">Mute</string>
+    <string name="unmute">Unmute</string>
+    <string name="stop">Stop</string>
+
+    <string name="status_off">Off</string>
+    <string name="status_live">Live</string>
+    <string name="status_muted">Muted</string>
+    <string name="status_standby">Standby</string>
+    <string name="status_searching">Searching</string>
+    <string name="status_mic_busy">Mic unavailable</string>
+    <string name="status_mic_busy_detail">Another app is holding the microphone</string>
+
+    <string name="detail_off">Tap to start</string>
+    <string name="detail_to">Streaming to %1$s</string>
+    <string name="detail_nobody">Streaming to %1$s · no app is listening</string>
+    <string name="detail_one">%1$s is listening</string>
+    <string name="detail_two">%1$s and %2$s are listening</string>
+    <string name="detail_many">%1$s and %2$d more are listening</string>
+    <string name="detail_standby">Opens when an app on %1$s listens</string>
+    <string name="detail_searching">Looking for your PC on this Wi-Fi</string>
+    <string name="detail_paired_elsewhere">%1$s is paired with another phone</string>
+</resources>

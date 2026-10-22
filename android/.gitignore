@@ -1,0 +1,10 @@
+.gradle/
+build/
+local.properties
+.kotlin/
+.cxx/
+*.keystore
+!debug.keystore
+app/src/main/jniLibs/
+keystore.properties
+build.log

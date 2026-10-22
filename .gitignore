@@ -1,0 +1,6 @@
+.shots/
+tools/test-send
+tools/*.wav
+tools/*.log
+tools/variant.conf
+pc/*.log

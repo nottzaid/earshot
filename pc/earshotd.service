@@ -1,0 +1,12 @@
+[Unit]
+Description=Earshot: phone microphone receiver
+After=pipewire.service pipewire-pulse.service
+Requires=pipewire.service
+
+[Service]
+ExecStart=%h/Projects/earshot/pc/earshotd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
