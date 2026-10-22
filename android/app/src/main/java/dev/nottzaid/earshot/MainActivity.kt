@@ -158,11 +158,11 @@ private fun hasMic(context: android.content.Context) =
 private fun shouldAsk(context: android.content.Context) =
     (context as? ComponentActivity)?.shouldShowRequestPermissionRationale(Manifest.permission.RECORD_AUDIO) == true
 
-/** Linear amplitude -> 0..1 over a -60..0 dBFS window. */
+/** Linear amplitude -> 0..1 over a -70..0 dBFS window (low enough that a quiet room still moves). */
 private fun normalize(linear: Float): Float {
     if (linear <= 1e-6f) return 0f
     val db = 20f * log10(linear)
-    return max(0f, (db + 60f) / 60f).coerceAtMost(1f)
+    return max(0f, (db + 70f) / 70f).coerceAtMost(1f)
 }
 
 private fun describe(rt: Runtime, p: Prefs, micDenied: Boolean): MainUi {

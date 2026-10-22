@@ -17,7 +17,7 @@ private val Context.store by preferencesDataStore("earshot")
 
 data class Prefs(
     val gainDb: Float = 0f,
-    val sound: SoundMode = SoundMode.Voice,
+    val sound: SoundMode = SoundMode.Studio,
     val latency: LatencyMode = LatencyMode.Balanced,
     val micKey: String? = null,
     val rumbleFilter: Boolean = false,
@@ -50,7 +50,7 @@ class Settings(private val context: Context) {
 
     private fun Preferences.toPrefs() = Prefs(
         gainDb = this[K.gain] ?: 0f,
-        sound = SoundMode.entries.firstOrNull { it.name == this[K.sound] } ?: SoundMode.Voice,
+        sound = SoundMode.entries.firstOrNull { it.name == this[K.sound] } ?: SoundMode.Studio,
         latency = LatencyMode.entries.firstOrNull { it.key == this[K.latency] } ?: LatencyMode.Balanced,
         micKey = this[K.mic],
         rumbleFilter = this[K.rumble] ?: false,
