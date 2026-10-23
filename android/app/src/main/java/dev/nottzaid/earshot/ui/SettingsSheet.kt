@@ -48,6 +48,7 @@ fun SettingsSheet(
     onLatency: (LatencyMode) -> Unit,
     onSmartStandby: (Boolean) -> Unit,
     onRumble: (Boolean) -> Unit,
+    onLevelControl: (Boolean) -> Unit,
     onDefaultMic: (Boolean) -> Unit,
     runsLocked: Boolean,
     onRunsLocked: (Boolean) -> Unit,
@@ -90,6 +91,11 @@ fun SettingsSheet(
                 "PC default mic",
                 "Make Earshot the PC's default mic while connected",
                 prefs.defaultMic, onDefaultMic,
+            )
+            ToggleRow(
+                "Level control",
+                "Set the mic's level by hand; off keeps it as the phone captures it",
+                prefs.levelControl, onLevelControl,
             )
             ToggleRow(
                 "Rumble filter",

@@ -1,11 +1,7 @@
 package dev.nottzaid.earshot.audio
 
-/** How much the phone processes the sound before it leaves. Values are oboe::InputPreset. */
-enum class SoundMode(val preset: Int, val title: String, val blurb: String) {
-    Studio(9 /* Unprocessed */, "Studio", "Untouched, full range"),
-    Voice(10 /* VoicePerformance */, "Voice", "Natural, lowest latency"),
-    Call(7 /* VoiceCommunication */, "Call", "Echo and noise cancelled"),
-}
+/** The capture path: oboe::InputPreset::Unprocessed, the mic untouched and full range. */
+const val CAPTURE_PRESET = 9
 
 /**
  * Network latency vs. robustness. The phone owns packet size and FEC block,

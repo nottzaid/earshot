@@ -8,7 +8,6 @@ import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import dev.nottzaid.earshot.audio.LatencyMode
-import dev.nottzaid.earshot.audio.SoundMode
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import java.util.UUID
@@ -17,7 +16,7 @@ private val Context.store by preferencesDataStore("earshot")
 
 data class Prefs(
     val gainDb: Float = 0f,
-    val sound: SoundMode = SoundMode.Studio,
+    val levelControl: Boolean = false, // off: the mic's own level (0 dB) and no slider
     val latency: LatencyMode = LatencyMode.Balanced,
     val micKey: String? = null,
     val rumbleFilter: Boolean = false,
@@ -32,12 +31,13 @@ data class Prefs(
     val pcSecret: String? = null,    // pairing secret shared with that PC
 ) {
     val paired get() = pcId != null && pcSecret != null
+    val effectiveGainDb get() = if (levelControl) gainDb else 0f
 }
 
 class Settings(private val context: Context) {
     private object K {
         val gain = floatPreferencesKey("gain_db")
-        val sound = stringPreferencesKey("sound")
+        val levelControl = booleanPreferencesKey("level_control")
         val latency = stringPreferencesKey("latency")
         val mic = stringPreferencesKey("mic")
         val rumble = booleanPreferencesKey("rumble")
@@ -56,7 +56,7 @@ class Settings(private val context: Context) {
 
     private fun Preferences.toPrefs() = Prefs(
         gainDb = this[K.gain] ?: 0f,
-        sound = SoundMode.entries.firstOrNull { it.name == this[K.sound] } ?: SoundMode.Studio,
+        levelControl = this[K.levelControl] ?: false,
         latency = LatencyMode.entries.firstOrNull { it.key == this[K.latency] } ?: LatencyMode.Balanced,
         micKey = this[K.mic],
         rumbleFilter = this[K.rumble] ?: false,
@@ -81,7 +81,7 @@ class Settings(private val context: Context) {
     }
 
     suspend fun setGain(db: Float) = context.store.edit { it[K.gain] = db }
-    suspend fun setSound(m: SoundMode) = context.store.edit { it[K.sound] = m.name }
+    suspend fun setLevelControl(on: Boolean) = context.store.edit { it[K.levelControl] = on }
     suspend fun setLatency(m: LatencyMode) = context.store.edit { it[K.latency] = m.key }
     suspend fun setMic(key: String) = context.store.edit { it[K.mic] = key }
     suspend fun setRumble(on: Boolean) = context.store.edit { it[K.rumble] = on }

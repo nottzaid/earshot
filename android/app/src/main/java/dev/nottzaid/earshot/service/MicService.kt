@@ -25,7 +25,7 @@ import dev.nottzaid.earshot.audio.LatencyMode
 import dev.nottzaid.earshot.audio.Mic
 import dev.nottzaid.earshot.audio.Mics
 import dev.nottzaid.earshot.audio.NativeEngine
-import dev.nottzaid.earshot.audio.SoundMode
+import dev.nottzaid.earshot.audio.CAPTURE_PRESET
 import dev.nottzaid.earshot.data.Prefs
 import dev.nottzaid.earshot.net.ControlEvent
 import dev.nottzaid.earshot.net.Discovery
@@ -66,7 +66,6 @@ import kotlin.math.abs
 private data class EngineConfig(
     val host: String,
     val micId: Int,
-    val sound: SoundMode,
     val latency: LatencyMode,
 )
 
@@ -161,7 +160,7 @@ class MicService : LifecycleService() {
             prefs.filterNotNull().collect { p ->
                 muted = p.muted
                 Earshot.update { it.copy(muted = p.muted) }
-                NativeEngine.setGainDb(p.gainDb)
+                NativeEngine.setGainDb(p.effectiveGainDb)
                 NativeEngine.setMuted(p.muted)
                 NativeEngine.setHighPass(p.rumbleFilter)
             }
@@ -243,7 +242,7 @@ class MicService : LifecycleService() {
         val host = pc?.address ?: engineConfig?.host ?: return null
         if (p.smartStandby && !listening) return null
         val mic = Mics.resolve(mics, p.micKey) ?: return null
-        return EngineConfig(host, mic.id, p.sound, p.latency)
+        return EngineConfig(host, mic.id, p.latency)
     }
 
     private suspend fun applyEngine(cfg: EngineConfig?, force: Boolean = false) = withContext(engineThread) {
@@ -262,11 +261,11 @@ class MicService : LifecycleService() {
             return@withContext
         }
         val p = settings.prefs.first()
-        NativeEngine.setGainDb(p.gainDb)
+        NativeEngine.setGainDb(p.effectiveGainDb)
         NativeEngine.setMuted(p.muted)
         NativeEngine.setHighPass(p.rumbleFilter)
         val state = NativeEngine.start(
-            cfg.host, cfg.micId, cfg.sound.preset,
+            cfg.host, cfg.micId, CAPTURE_PRESET,
             cfg.latency.packetUs, cfg.latency.fecSource, cfg.latency.fecRepair,
         )
         if (destroyed) {

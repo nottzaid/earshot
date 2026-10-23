@@ -147,7 +147,6 @@ private fun App() {
         },
         onStop = { MicService.stop(context) },
         onMic = { scope.launch { settings.setMic(it.key) } },
-        onSound = { scope.launch { settings.setSound(it) } },
         onGainPreview = { NativeEngine.setGainDb(it) },
         onGainCommit = { scope.launch { settings.setGain(it) } },
         onOpenSettings = { showSettings = true },
@@ -163,6 +162,7 @@ private fun App() {
             onLatency = { scope.launch { settings.setLatency(it) } },
             onSmartStandby = { scope.launch { settings.setSmartStandby(it) } },
             onRumble = { scope.launch { settings.setRumble(it) } },
+            onLevelControl = { scope.launch { settings.setLevelControl(it) } },
             onDefaultMic = { scope.launch { settings.setDefaultMic(it) } },
             runsLocked = runsLocked,
             onRunsLocked = { on ->

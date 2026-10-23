@@ -62,7 +62,6 @@ import dev.nottzaid.earshot.net.FoundPc
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
-import dev.nottzaid.earshot.audio.SoundMode
 import dev.nottzaid.earshot.data.Prefs
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -98,7 +97,6 @@ fun MainScreen(
     onOrb: () -> Unit,
     onStop: () -> Unit,
     onMic: (Mic) -> Unit,
-    onSound: (SoundMode) -> Unit,
     onGainPreview: (Float) -> Unit,
     onGainCommit: (Float) -> Unit,
     onOpenSettings: () -> Unit,
@@ -162,7 +160,7 @@ fun MainScreen(
             }
             if (ui.pairable.isNotEmpty()) PairChoices(ui.pairable, onPair) else StopSlot(ui.running, onStop)
             Spacer(Modifier.weight(1f))
-            ControlsCard(prefs, mics, meters, onMic, onSound, onGainPreview, onGainCommit)
+            ControlsCard(prefs, mics, meters, onMic, onGainPreview, onGainCommit)
             Spacer(Modifier.height(16.dp))
         }
     }
@@ -241,7 +239,6 @@ private fun ControlsCard(
     mics: List<Mic>,
     meters: Meters,
     onMic: (Mic) -> Unit,
-    onSound: (SoundMode) -> Unit,
     onGainPreview: (Float) -> Unit,
     onGainCommit: (Float) -> Unit,
 ) {
@@ -263,19 +260,15 @@ private fun ControlsCard(
             Spacer(Modifier.height(8.dp))
         }
 
-        SectionLabel("Sound") {
-            Text(prefs.sound.blurb, style = MaterialTheme.typography.bodySmall, color = p.textMuted)
-        }
-        Segmented(SoundMode.entries, prefs.sound, { it.title }, onSound)
-        Spacer(Modifier.height(8.dp))
-
         // Gain: the slider moves locally and live; the store hears about it when the finger lifts.
         var gain by remember(prefs.gainDb) { mutableStateOf(prefs.gainDb) }
         SectionLabel("Level") {
-            Text(formatDb(gain), style = MaterialTheme.typography.labelMedium, color = if (abs(gain) < 0.05f) p.textFaint else p.text)
+            if (prefs.levelControl) {
+                Text(formatDb(gain), style = MaterialTheme.typography.labelMedium, color = if (abs(gain) < 0.05f) p.textFaint else p.text)
+            }
         }
         LevelMeter(meters.rms, meters.peak, meters.clipping, Modifier.padding(top = 4.dp))
-        Slider(
+        if (prefs.levelControl) Slider(
             value = gain,
             onValueChange = { raw ->
                 // A soft detent at 0 dB so "no gain" is easy to find again.
