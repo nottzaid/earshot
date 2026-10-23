@@ -230,9 +230,10 @@ class MicService : LifecycleService() {
 
         // Settings the PC needs to hear about.
         lifecycleScope.launch {
-            prefs.filterNotNull().map { it.latency to it.defaultMic }.distinctUntilChanged().collect { (lat, def) ->
-                outgoing.trySend(jsonOf("t" to "set", "mode" to lat.key, "default" to def))
-            }
+            prefs.filterNotNull().map { Triple(it.latency, it.defaultMic, it.echoCancel) }.distinctUntilChanged()
+                .collect { (lat, def, echo) ->
+                    outgoing.trySend(jsonOf("t" to "set", "mode" to lat.key, "default" to def, "echo" to echo))
+                }
         }
     }
 
@@ -347,7 +348,7 @@ class MicService : LifecycleService() {
         val p = settings.prefs.first()
         val hello = jsonOf(
             "t" to "hello", "v" to PROTO_VERSION, "id" to deviceId, "name" to deviceName(),
-            "prefs" to jsonOf("mode" to p.latency.key, "default" to p.defaultMic),
+            "prefs" to jsonOf("mode" to p.latency.key, "default" to p.defaultMic, "echo" to p.echoCancel),
         )
         while (outgoing.tryReceive().isSuccess) Unit // drop anything queued for a previous session
         var avgRtt = -1f

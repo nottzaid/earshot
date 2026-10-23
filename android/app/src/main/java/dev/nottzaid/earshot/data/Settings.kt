@@ -17,6 +17,7 @@ private val Context.store by preferencesDataStore("earshot")
 data class Prefs(
     val gainDb: Float = 0f,
     val levelControl: Boolean = false, // off: the mic's own level (0 dB) and no slider
+    val echoCancel: Boolean = false,   // the PC subtracts what its own speakers put into the mic
     val latency: LatencyMode = LatencyMode.Balanced,
     val micKey: String? = null,
     val rumbleFilter: Boolean = false,
@@ -38,6 +39,7 @@ class Settings(private val context: Context) {
     private object K {
         val gain = floatPreferencesKey("gain_db")
         val levelControl = booleanPreferencesKey("level_control")
+        val echoCancel = booleanPreferencesKey("echo_cancel")
         val latency = stringPreferencesKey("latency")
         val mic = stringPreferencesKey("mic")
         val rumble = booleanPreferencesKey("rumble")
@@ -57,6 +59,7 @@ class Settings(private val context: Context) {
     private fun Preferences.toPrefs() = Prefs(
         gainDb = this[K.gain] ?: 0f,
         levelControl = this[K.levelControl] ?: false,
+        echoCancel = this[K.echoCancel] ?: false,
         latency = LatencyMode.entries.firstOrNull { it.key == this[K.latency] } ?: LatencyMode.Balanced,
         micKey = this[K.mic],
         rumbleFilter = this[K.rumble] ?: false,
@@ -82,6 +85,7 @@ class Settings(private val context: Context) {
 
     suspend fun setGain(db: Float) = context.store.edit { it[K.gain] = db }
     suspend fun setLevelControl(on: Boolean) = context.store.edit { it[K.levelControl] = on }
+    suspend fun setEchoCancel(on: Boolean) = context.store.edit { it[K.echoCancel] = on }
     suspend fun setLatency(m: LatencyMode) = context.store.edit { it[K.latency] = m.key }
     suspend fun setMic(key: String) = context.store.edit { it[K.mic] = key }
     suspend fun setRumble(on: Boolean) = context.store.edit { it[K.rumble] = on }

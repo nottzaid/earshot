@@ -49,6 +49,7 @@ fun SettingsSheet(
     onSmartStandby: (Boolean) -> Unit,
     onRumble: (Boolean) -> Unit,
     onLevelControl: (Boolean) -> Unit,
+    onEchoCancel: (Boolean) -> Unit,
     onDefaultMic: (Boolean) -> Unit,
     runsLocked: Boolean,
     onRunsLocked: (Boolean) -> Unit,
@@ -91,6 +92,11 @@ fun SettingsSheet(
                 "PC default mic",
                 "Make Earshot the PC's default mic while connected",
                 prefs.defaultMic, onDefaultMic,
+            )
+            ToggleRow(
+                "Echo cancellation",
+                "Remove what the PC's speakers play from the mic; voices and the room stay untouched",
+                prefs.echoCancel, onEchoCancel,
             )
             ToggleRow(
                 "Level control",

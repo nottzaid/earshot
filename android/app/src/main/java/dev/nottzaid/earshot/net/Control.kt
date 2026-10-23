@@ -13,6 +13,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
+import java.io.IOException
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.DatagramPacket
@@ -62,7 +63,9 @@ object Discovery {
      */
     suspend fun probe(hint: String?, windowMs: Long = 1200): List<FoundPc> = withContext(Dispatchers.IO) {
         val found = linkedMapOf<String, FoundPc>()
-        DatagramSocket().use { sock ->
+        // No network at all (between Wi-Fi networks, say) makes even creating the socket fail:
+        // that's "found nothing", and the caller probes again.
+        try { DatagramSocket().use { sock ->
             sock.broadcast = true
             sock.soTimeout = 150
             val payload = PROBE.toByteArray()
@@ -98,6 +101,7 @@ object Discovery {
                 )
                 if (addr == hint) break // the PC we know answered: no need to wait out the window
             }
+        } } catch (_: IOException) {
         }
         found.values.toList()
     }

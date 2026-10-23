@@ -163,6 +163,7 @@ private fun App() {
             onSmartStandby = { scope.launch { settings.setSmartStandby(it) } },
             onRumble = { scope.launch { settings.setRumble(it) } },
             onLevelControl = { scope.launch { settings.setLevelControl(it) } },
+            onEchoCancel = { scope.launch { settings.setEchoCancel(it) } },
             onDefaultMic = { scope.launch { settings.setDefaultMic(it) } },
             runsLocked = runsLocked,
             onRunsLocked = { on ->
