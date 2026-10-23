@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings as AndroidSettings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -67,13 +68,23 @@ private fun App() {
     val mics by remember { Mics.watch(context) }.collectAsStateWithLifecycle(initialValue = Mics.list(context))
     var showSettings by rememberSaveable { mutableStateOf(false) }
     var micDenied by remember { mutableStateOf(false) }
+    var runsLocked by remember { mutableStateOf(runsLocked(context)) }
     val meters = remember { Meters() }
     var diag by remember { mutableStateOf(Diagnostics(null, null, false, false, 0, 0, false)) }
+
+    // First start only: without the exemption, the link dies a few minutes after the screen goes off.
+    fun start() {
+        MicService.start(context)
+        if (!runsLocked(context) && prefs?.askedBackground == false) {
+            askToRunLocked(context)
+            scope.launch { settings.setAskedBackground() }
+        }
+    }
 
     val permissions = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
         if (result[Manifest.permission.RECORD_AUDIO] == true) {
             micDenied = false
-            MicService.start(context)
+            start()
         } else {
             micDenied = true
         }
@@ -81,6 +92,9 @@ private fun App() {
 
     // Meters at display rate, straight from the engine; draw-phase reads keep this off the recomposer.
     val lifecycle = LocalLifecycleOwner.current.lifecycle
+    LaunchedEffect(Unit) {
+        lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) { runsLocked = runsLocked(context) } // back from the system dialog
+    }
     LaunchedEffect(Unit) {
         lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
             val status = EngineStatus()
@@ -127,7 +141,7 @@ private fun App() {
                 micDenied && !shouldAsk(context) -> context.startActivity(
                     Intent(AndroidSettings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", context.packageName, null)),
                 )
-                hasMic(context) -> MicService.start(context)
+                hasMic(context) -> start()
                 else -> permissions.launch(arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS))
             }
         },
@@ -150,6 +164,12 @@ private fun App() {
             onSmartStandby = { scope.launch { settings.setSmartStandby(it) } },
             onRumble = { scope.launch { settings.setRumble(it) } },
             onDefaultMic = { scope.launch { settings.setDefaultMic(it) } },
+            runsLocked = runsLocked,
+            onRunsLocked = { on ->
+                // Granting has a system dialog; revoking only has the system list.
+                if (on) askToRunLocked(context)
+                else context.startActivity(Intent(AndroidSettings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            },
             onForget = {
                 // Running: the service tells the PC to forget us too. Off: only this phone forgets.
                 if (runtime.phase != Phase.Off) MicService.forget(context) else scope.launch { settings.forgetPc() }
@@ -160,6 +180,13 @@ private fun App() {
 
 private fun hasMic(context: android.content.Context) =
     ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+private fun runsLocked(context: android.content.Context) =
+    context.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(context.packageName)
+
+private fun askToRunLocked(context: android.content.Context) = context.startActivity(
+    Intent(AndroidSettings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.fromParts("package", context.packageName, null)),
+)
 
 private fun shouldAsk(context: android.content.Context) =
     (context as? ComponentActivity)?.shouldShowRequestPermissionRationale(Manifest.permission.RECORD_AUDIO) == true

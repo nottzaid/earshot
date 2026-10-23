@@ -49,6 +49,8 @@ fun SettingsSheet(
     onSmartStandby: (Boolean) -> Unit,
     onRumble: (Boolean) -> Unit,
     onDefaultMic: (Boolean) -> Unit,
+    runsLocked: Boolean,
+    onRunsLocked: (Boolean) -> Unit,
     onForget: () -> Unit,
 ) {
     val p = LocalPalette.current
@@ -93,6 +95,11 @@ fun SettingsSheet(
                 "Rumble filter",
                 "Cut hum, wind and handling noise below 80 Hz",
                 prefs.rumbleFilter, onRumble,
+            )
+            ToggleRow(
+                "Run while locked",
+                "Keep the PC link with the screen off; Android cuts it otherwise",
+                runsLocked, onRunsLocked,
             )
 
             Spacer(Modifier.height(14.dp))

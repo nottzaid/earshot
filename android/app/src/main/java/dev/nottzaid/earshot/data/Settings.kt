@@ -24,6 +24,7 @@ data class Prefs(
     val smartStandby: Boolean = true,
     val defaultMic: Boolean = true,
     val muted: Boolean = false,
+    val askedBackground: Boolean = false, // asked once to run unrestricted; afterwards it's a switch in settings
     val deviceId: String = "",
     val pcHost: String? = null,      // last address of the paired PC (a hint; identity is pcId)
     val pcId: String? = null,        // the paired PC's stable id
@@ -43,6 +44,7 @@ class Settings(private val context: Context) {
         val standby = booleanPreferencesKey("smart_standby")
         val defaultMic = booleanPreferencesKey("default_mic")
         val muted = booleanPreferencesKey("muted")
+        val askedBackground = booleanPreferencesKey("asked_background")
         val deviceId = stringPreferencesKey("device_id")
         val pcHost = stringPreferencesKey("pc_host")
         val pcId = stringPreferencesKey("pc_id")
@@ -61,6 +63,7 @@ class Settings(private val context: Context) {
         smartStandby = this[K.standby] ?: true,
         defaultMic = this[K.defaultMic] ?: true,
         muted = this[K.muted] ?: false,
+        askedBackground = this[K.askedBackground] ?: false,
         deviceId = this[K.deviceId].orEmpty(),
         pcHost = this[K.pcHost],
         pcId = this[K.pcId],
@@ -85,6 +88,7 @@ class Settings(private val context: Context) {
     suspend fun setSmartStandby(on: Boolean) = context.store.edit { it[K.standby] = on }
     suspend fun setDefaultMic(on: Boolean) = context.store.edit { it[K.defaultMic] = on }
     suspend fun setMuted(on: Boolean) = context.store.edit { it[K.muted] = on }
+    suspend fun setAskedBackground() = context.store.edit { it[K.askedBackground] = true }
 
     suspend fun rememberPc(host: String, id: String, name: String, secret: String?) = context.store.edit {
         it[K.pcHost] = host

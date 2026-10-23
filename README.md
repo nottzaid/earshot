@@ -41,6 +41,14 @@ What this does not cover: the audio itself is plain RTP. Anyone on the same LAN 
 or send audio into the Earshot mic. Keep the ports open to your LAN only, and use it on networks
 you trust.
 
+### If the stream stalls a few seconds in
+
+Phones set up TDLS (a direct Wi-Fi link to the PC) once traffic gets heavy. Some PC drivers
+accept the setup but can't install the link key (`TDLS: Failed to set TPK to the driver` in
+wpa_supplicant's log), and everything the phone sends after that is lost until the link times
+out, about 30 s later. Decline TDLS on the PC: `wpa_cli -i wlan0 set tdls_disabled 1`, applied on
+every connect (a NetworkManager dispatcher script does it).
+
 ## Phone
 
 ```
@@ -48,6 +56,10 @@ native/build-roc-android.sh      # once, or after changing roc
 cd android && ./gradlew assembleRelease
 adb install -r app/build/outputs/apk/release/app-release.apk
 ```
+
+Allow "run in the background" when the app asks (or the **Run while locked** switch in its
+settings): without it, Doze cuts the phone's Wi-Fi to the app a few minutes after the screen goes
+off, even though a foreground service is running.
 
 Release builds are signed with the key named in `android/keystore.properties` (not in git).
 

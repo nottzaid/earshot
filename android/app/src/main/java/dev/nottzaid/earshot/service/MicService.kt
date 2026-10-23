@@ -86,6 +86,8 @@ class MicService : LifecycleService() {
     @Volatile private var engineConfig: EngineConfig? = null
     @Volatile private var muted = false
     @Volatile private var destroyed = false
+    /** The PC link holds the CPU awake: asleep, the phone hears the PC tens of seconds late, or not at all. */
+    @Volatile private var linkHeld = false
     private val muteSeq = AtomicInteger(0)
     private var started = false
 
@@ -184,10 +186,15 @@ class MicService : LifecycleService() {
             var lostJob: Job? = null
             connectedPc.map { it != null }.distinctUntilChanged().collect { connected ->
                 lostJob?.cancel()
-                if (connected) linkLost.value = false
-                else lostJob = launch {
-                    delay(LINK_LOST_MS)
+                if (connected) {
+                    linkLost.value = false
+                    linkHeld = true
+                    syncWakeLock()
+                } else lostJob = launch {
+                    delay(LINK_LOST_MS) // still awake here, so the reconnect isn't left to the phone's next wakeup
                     linkLost.value = true
+                    linkHeld = false
+                    syncWakeLock()
                 }
             }
         }
@@ -210,7 +217,7 @@ class MicService : LifecycleService() {
                     delay(1500)
                     applyEngine(desired.value, force = true) // whatever is wanted *now*, not what failed
                 }
-                if (++ticks % (30 * 60 * 4) == 0 && wakeLock.isHeld) wakeLock.acquire(WAKE_LOCK_MS) // renew: streams can outlive one timeout
+                if (++ticks % (30 * 60 * 4) == 0 && wakeLock.isHeld) wakeLock.acquire(WAKE_LOCK_MS) // renew: a link can outlive one timeout
                 val rt = Earshot.runtime.value
                 val shown = Triple(rt.phase, muted, rt.problem)
                 if (shown != lastShown) {
@@ -424,15 +431,23 @@ class MicService : LifecycleService() {
 
     private fun acquireLocks() {
         if (destroyed) return
-        if (!wakeLock.isHeld) wakeLock.acquire(WAKE_LOCK_MS)
+        syncWakeLock()
         if (!wifiLowLatency.isHeld) wifiLowLatency.acquire()
         if (!wifiHighPerf.isHeld) wifiHighPerf.acquire()
     }
 
     private fun releaseLocks() {
-        if (wakeLock.isHeld) wakeLock.release()
         if (wifiLowLatency.isHeld) wifiLowLatency.release()
         if (wifiHighPerf.isHeld) wifiHighPerf.release()
+        syncWakeLock()
+    }
+
+    /** CPU awake while streaming or linked to the PC; the Wi-Fi locks are for streaming only. */
+    @Synchronized
+    private fun syncWakeLock() {
+        val want = !destroyed && (linkHeld || engineConfig != null)
+        if (want && !wakeLock.isHeld) wakeLock.acquire(WAKE_LOCK_MS)
+        else if (!want && wakeLock.isHeld) wakeLock.release()
     }
 
     // ------------------------------------------------------------ notification
