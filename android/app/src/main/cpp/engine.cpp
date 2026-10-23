@@ -61,31 +61,6 @@ private:
     std::atomic<size_t> w_{0}, r_{0};
 };
 
-// 2nd-order Butterworth high-pass (transposed direct form II).
-struct HighPass {
-    float b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0, z1 = 0, z2 = 0;
-
-    void design(float hz) {
-        const float w = 2.0f * float(M_PI) * hz / kRate;
-        const float c = std::cos(w), alpha = std::sin(w) / (2.0f * float(M_SQRT1_2));
-        const float a0 = 1 + alpha;
-        b0 = (1 + c) / 2 / a0;
-        b1 = -(1 + c) / a0;
-        b2 = (1 + c) / 2 / a0;
-        a1 = -2 * c / a0;
-        a2 = (1 - alpha) / a0;
-    }
-
-    float process(float x) {
-        float y = b0 * x + z1;
-        z1 = b1 * x - a1 * y + z2;
-        z2 = b2 * x - a2 * y;
-        return y;
-    }
-
-    void reset() { z1 = z2 = 0; }
-};
-
 struct Config {
     std::string host;
     int deviceId = 0;
@@ -98,7 +73,6 @@ public:
     // -- live controls (any thread)
     std::atomic<float> gainTarget{1.0f};
     std::atomic<bool> muted{false};
-    std::atomic<bool> highPass{false};
 
     // -- meter / status (worker writes, UI reads)
     std::atomic<float> meterPeak{0}, meterRms{0};
@@ -237,10 +211,7 @@ private:
         const float release = 1.0f - std::exp(-1.0f / (0.150f * kRate));
         constexpr float kCeiling = 0.966f;  // -0.3 dBFS
         float gain = gainTarget.load(), muteGain = muted ? 0.0f : 1.0f, limit = 1.0f;
-        bool hpOn = false;
         int64_t lastQuery = 0;
-        HighPass hp;
-        hp.design(80.0f);
 
         while (running_) {
             timespec deadline;
@@ -265,11 +236,6 @@ private:
 
             size_t n;
             while ((n = ring_.read(buf, kMax)) > 0) {
-                const bool wantHp = highPass.load(std::memory_order_relaxed);
-                if (wantHp != hpOn) {
-                    hpOn = wantHp;
-                    hp.reset();
-                }
                 const float gT = gainTarget.load(std::memory_order_relaxed);
                 const float mT = muted.load(std::memory_order_relaxed) ? 0.0f : 1.0f;
                 float peak = 0, sumSq = 0;
@@ -277,7 +243,6 @@ private:
                 for (size_t i = 0; i < n; i++) {
                     float x = buf[i];
                     if (std::fabs(x) >= 0.999f) clipped = true;  // the converter itself clipped
-                    if (hpOn) x = hp.process(x);
                     gain += (gT - gain) * smooth;
                     muteGain += (mT - muteGain) * smooth;
                     x *= gain;
@@ -366,10 +331,6 @@ JNIEXPORT void JNICALL Java_dev_nottzaid_earshot_audio_NativeEngine_setGainDb(JN
 
 JNIEXPORT void JNICALL Java_dev_nottzaid_earshot_audio_NativeEngine_setMuted(JNIEnv*, jobject, jboolean m) {
     engine().muted = m;
-}
-
-JNIEXPORT void JNICALL Java_dev_nottzaid_earshot_audio_NativeEngine_setHighPass(JNIEnv*, jobject, jboolean on) {
-    engine().highPass = on;
 }
 
 // out: [peak, rms, clipping, receivers, mmap, exclusive, burstFrames, overruns, state, sessionId]

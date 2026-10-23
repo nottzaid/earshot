@@ -65,13 +65,10 @@ off, even though a foreground service is running.
 
 Release builds are signed with the key named in `android/keystore.properties` (not in git).
 
-## Latency modes
+## Latency
 
-| Mode | PC jitter buffer | Packet | FEC block |
-|---|---|---|---|
-| Tight | 30 ms | 2.5 ms | 6 + 3 |
-| Balanced | 50 ms | 2.5 ms | 10 + 5 |
-| Steady | 100 ms | 5 ms | 10 + 6 |
+One setting, the lowest that stays clean: 2.5 ms packets, Reed-Solomon FEC over blocks of
+6 + 3 packets, and a 30 ms jitter buffer on the PC.
 
 ### Clock matching
 

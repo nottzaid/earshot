@@ -7,7 +7,6 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
-import dev.nottzaid.earshot.audio.LatencyMode
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import java.util.UUID
@@ -18,9 +17,7 @@ data class Prefs(
     val gainDb: Float = 0f,
     val levelControl: Boolean = false, // off: the mic's own level (0 dB) and no slider
     val echoCancel: Boolean = false,   // the PC subtracts what its own speakers put into the mic
-    val latency: LatencyMode = LatencyMode.Balanced,
     val micKey: String? = null,
-    val rumbleFilter: Boolean = false,
     val smartStandby: Boolean = true,
     val defaultMic: Boolean = true,
     val muted: Boolean = false,
@@ -40,9 +37,7 @@ class Settings(private val context: Context) {
         val gain = floatPreferencesKey("gain_db")
         val levelControl = booleanPreferencesKey("level_control")
         val echoCancel = booleanPreferencesKey("echo_cancel")
-        val latency = stringPreferencesKey("latency")
         val mic = stringPreferencesKey("mic")
-        val rumble = booleanPreferencesKey("rumble")
         val standby = booleanPreferencesKey("smart_standby")
         val defaultMic = booleanPreferencesKey("default_mic")
         val muted = booleanPreferencesKey("muted")
@@ -60,9 +55,7 @@ class Settings(private val context: Context) {
         gainDb = this[K.gain] ?: 0f,
         levelControl = this[K.levelControl] ?: false,
         echoCancel = this[K.echoCancel] ?: false,
-        latency = LatencyMode.entries.firstOrNull { it.key == this[K.latency] } ?: LatencyMode.Balanced,
         micKey = this[K.mic],
-        rumbleFilter = this[K.rumble] ?: false,
         smartStandby = this[K.standby] ?: true,
         defaultMic = this[K.defaultMic] ?: true,
         muted = this[K.muted] ?: false,
@@ -86,9 +79,7 @@ class Settings(private val context: Context) {
     suspend fun setGain(db: Float) = context.store.edit { it[K.gain] = db }
     suspend fun setLevelControl(on: Boolean) = context.store.edit { it[K.levelControl] = on }
     suspend fun setEchoCancel(on: Boolean) = context.store.edit { it[K.echoCancel] = on }
-    suspend fun setLatency(m: LatencyMode) = context.store.edit { it[K.latency] = m.key }
     suspend fun setMic(key: String) = context.store.edit { it[K.mic] = key }
-    suspend fun setRumble(on: Boolean) = context.store.edit { it[K.rumble] = on }
     suspend fun setSmartStandby(on: Boolean) = context.store.edit { it[K.standby] = on }
     suspend fun setDefaultMic(on: Boolean) = context.store.edit { it[K.defaultMic] = on }
     suspend fun setMuted(on: Boolean) = context.store.edit { it[K.muted] = on }

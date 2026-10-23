@@ -234,9 +234,9 @@ fun Orb(
     }
 }
 
-/** RMS bar with a peak tick; red while clipping. Draw-phase only. */
+/** RMS bar; red while clipping. Draw-phase only. */
 @Composable
-fun LevelMeter(rms: FloatState, peak: FloatState, clipping: FloatState, modifier: Modifier = Modifier) {
+fun LevelMeter(rms: FloatState, clipping: FloatState, modifier: Modifier = Modifier) {
     val p = LocalPalette.current
     Canvas(modifier.fillMaxWidth().height(6.dp)) {
         val h = size.height
@@ -250,72 +250,6 @@ fun LevelMeter(rms: FloatState, peak: FloatState, clipping: FloatState, modifier
                 startX = 0f, endX = size.width,
             )
             drawRoundRect(brush, size = Size(max(w, h), h), cornerRadius = radius)
-        }
-        val px = size.width * peak.floatValue
-        if (px > h) {
-            val tick = 2.dp.toPx()
-            drawRoundRect(
-                lerp(p.text, p.danger, clip).copy(alpha = 0.85f),
-                topLeft = Offset(min(px, size.width - tick) - tick / 2, -2.dp.toPx()),
-                size = Size(tick, h + 4.dp.toPx()),
-                cornerRadius = CornerRadius(tick / 2, tick / 2),
-            )
-        }
-    }
-}
-
-/** A segmented picker whose highlight glides between options. */
-@Composable
-fun <T> Segmented(
-    options: List<T>,
-    selected: T,
-    label: (T) -> String,
-    onSelect: (T) -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val p = LocalPalette.current
-    val haptics = LocalHapticFeedback.current
-    val index = options.indexOf(selected).coerceAtLeast(0)
-    BoxWithConstraints(
-        modifier
-            .fillMaxWidth()
-            .height(44.dp)
-            .clip(RoundedCornerShape(14.dp))
-            .background(p.surfaceHigh)
-            .padding(4.dp),
-    ) {
-        val segW = maxWidth / options.size
-        val x by animateDpAsState(segW * index, spring(dampingRatio = 0.8f, stiffness = Spring.StiffnessMediumLow), label = "seg")
-        Box(
-            Modifier
-                .offset(x = x)
-                .width(segW)
-                .fillMaxHeight()
-                .clip(RoundedCornerShape(10.dp))
-                .background(if (p.dark) p.outline else p.surface)
-                .drawBehind {
-                    if (!p.dark) drawRoundRect(p.outline, cornerRadius = CornerRadius(10.dp.toPx()), style = Stroke(1.dp.toPx()))
-                },
-        )
-        Row(Modifier.fillMaxSize()) {
-            options.forEachIndexed { i, opt ->
-                val color by animateColorAsState(if (i == index) p.text else p.textMuted, tween(220), label = "segText")
-                Box(
-                    Modifier
-                        .weight(1f)
-                        .fillMaxHeight()
-                        .clip(RoundedCornerShape(10.dp))
-                        .selectable(i == index, role = Role.Tab) {
-                            if (i != index) {
-                                haptics.performHapticFeedback(HapticFeedbackType.SegmentTick)
-                                onSelect(opt)
-                            }
-                        },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text(label(opt), style = MaterialTheme.typography.labelLarge, color = color, maxLines = 1)
-                }
-            }
         }
     }
 }

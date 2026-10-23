@@ -23,7 +23,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
-import dev.nottzaid.earshot.audio.LatencyMode
 import dev.nottzaid.earshot.data.Prefs
 import dev.nottzaid.earshot.service.Runtime
 
@@ -45,9 +44,7 @@ fun SettingsSheet(
     runtime: Runtime,
     diagnostics: Diagnostics,
     onDismiss: () -> Unit,
-    onLatency: (LatencyMode) -> Unit,
     onSmartStandby: (Boolean) -> Unit,
-    onRumble: (Boolean) -> Unit,
     onLevelControl: (Boolean) -> Unit,
     onEchoCancel: (Boolean) -> Unit,
     onDefaultMic: (Boolean) -> Unit,
@@ -74,14 +71,6 @@ fun SettingsSheet(
             Text("Settings", style = MaterialTheme.typography.titleLarge, color = p.text)
             Spacer(Modifier.height(14.dp))
 
-            SectionLabel("Latency") {
-                Text("${prefs.latency.targetMs} ms buffer", style = MaterialTheme.typography.labelMedium, color = p.text)
-            }
-            Spacer(Modifier.height(4.dp))
-            Segmented(LatencyMode.entries, prefs.latency, { it.title }, onLatency)
-            Text(prefs.latency.blurb, style = MaterialTheme.typography.bodyMedium, color = p.textMuted, modifier = Modifier.padding(top = 6.dp, start = 4.dp))
-            Spacer(Modifier.height(14.dp))
-
             SectionLabel("Behaviour")
             ToggleRow(
                 "Smart standby",
@@ -102,11 +91,6 @@ fun SettingsSheet(
                 "Level control",
                 "Set the mic's level by hand; off keeps it as the phone captures it",
                 prefs.levelControl, onLevelControl,
-            )
-            ToggleRow(
-                "Rumble filter",
-                "Cut hum, wind and handling noise below 80 Hz",
-                prefs.rumbleFilter, onRumble,
             )
             ToggleRow(
                 "Run while locked",

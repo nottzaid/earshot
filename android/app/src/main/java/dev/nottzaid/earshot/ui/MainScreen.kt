@@ -83,7 +83,6 @@ enum class PillDot { Off, Searching, Connected, Problem }
 
 class Meters {
     val rms = mutableFloatStateOf(0f)
-    val peak = mutableFloatStateOf(0f)
     val clipping = mutableFloatStateOf(0f)
     val orbLevel = mutableFloatStateOf(0f)
 }
@@ -267,7 +266,7 @@ private fun ControlsCard(
                 Text(formatDb(gain), style = MaterialTheme.typography.labelMedium, color = if (abs(gain) < 0.05f) p.textFaint else p.text)
             }
         }
-        LevelMeter(meters.rms, meters.peak, meters.clipping, Modifier.padding(top = 4.dp))
+        LevelMeter(meters.rms, meters.clipping, Modifier.padding(top = 4.dp))
         if (prefs.levelControl) Slider(
             value = gain,
             onValueChange = { raw ->

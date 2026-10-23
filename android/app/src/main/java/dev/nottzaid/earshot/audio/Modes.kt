@@ -4,21 +4,12 @@ package dev.nottzaid.earshot.audio
 const val CAPTURE_PRESET = 9
 
 /**
- * Network latency vs. robustness. The phone owns packet size and FEC block,
- * the PC owns the jitter buffer target (LATENCY_MS in earshotd); both use [key].
+ * The network link: as little delay as stays clean. The FEC block (6 packets of 2.5 ms) fits
+ * well inside the PC's jitter buffer (LATENCY_MS in earshotd), so repair packets arrive while
+ * they can still help.
  */
-enum class LatencyMode(
-    val key: String,
-    val title: String,
-    val targetMs: Int,
-    val packetUs: Int,
-    val fecSource: Int,
-    val fecRepair: Int,
-    val blurb: String,
-) {
-    Tight("tight", "Tight", 30, 2500, 6, 3, "Lowest delay, needs a clean signal"),
-    Balanced("balanced", "Balanced", 50, 2500, 10, 5, "Low delay, rides out Wi-Fi hiccups"),
-    // The FEC block (source packets x packet length) stays at or under half the PC's target,
-    // so repair packets arrive while they can still help.
-    Steady("steady", "Steady", 100, 5000, 10, 6, "For crowded or distant Wi-Fi"),
+object Link {
+    const val PACKET_US = 2500
+    const val FEC_SOURCE = 6
+    const val FEC_REPAIR = 3
 }

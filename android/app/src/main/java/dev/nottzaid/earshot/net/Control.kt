@@ -43,7 +43,6 @@ data class PcState(
     /** The phone's last mute request the PC had applied when it sent this; older values are stale. */
     val muteSeq: Int = 0,
     val isDefault: Boolean = false,
-    val mode: String? = null,
     val receiverUp: Boolean = false,
 )
 
@@ -242,7 +241,6 @@ private fun JSONObject.toPcState() = PcState(
     muted = optBoolean("muted"),
     muteSeq = optInt("mute_seq"),
     isDefault = optBoolean("default"),
-    mode = optString("mode").ifEmpty { null },
     receiverUp = optString("receiver") == "up",
 )
 

@@ -16,7 +16,6 @@ object NativeEngine {
     external fun stop()
     external fun setGainDb(db: Float)
     external fun setMuted(muted: Boolean)
-    external fun setHighPass(on: Boolean)
 
     /** Fills [out] (size >= STATUS_SIZE); see the Status accessors. */
     external fun readStatus(out: FloatArray)

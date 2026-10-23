@@ -3,7 +3,7 @@
 
 Runs the ROC receiver that turns the phone's stream into a PipeWire mic, answers
 discovery probes, and keeps a control channel with the paired phone: who is
-listening, mute, default-mic and latency mode.
+listening, mute, default-mic and echo cancellation.
 
 Usage: earshotd [run]       run the daemon (default)
        earshotd unpair      forget the paired phone
@@ -33,9 +33,8 @@ MAX_LINE = 16 * 1024
 NODE_NAME = "earshot.mic"
 NODE_DESCRIPTION = "Earshot"
 
-# Receiver-side half of each latency mode; the phone owns the packet/FEC half.
-LATENCY_MS = {"tight": 30, "balanced": 50, "steady": 100}
-DEFAULT_MODE = "balanced"
+# The receiver's jitter buffer; the phone's packet and FEC sizes (Link in the app) fit inside it.
+LATENCY_MS = 30
 
 # Graceful fallback when the phone vanishes: keep the default mic for a moment
 # so a Wi-Fi blip doesn't bounce every app to another mic and back.
@@ -111,16 +110,13 @@ class Receiver:
     """Owns the earshot-rx child that hosts the phone's source node."""
 
     def __init__(self, on_change):
-        self.latency = LATENCY_MS[DEFAULT_MODE]
         self.echo = False
         self.proc = None
         self.status = "down"
         self._on_change = on_change
         self._task = None
-        self._restart = asyncio.Event()
 
-    def start(self, latency, echo):
-        self.latency = latency
+    def start(self, echo):
         self.echo = echo
         self._task = asyncio.create_task(self._supervise())
 
@@ -133,11 +129,6 @@ class Receiver:
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
-    def set_latency(self, latency):
-        if latency != self.latency:
-            self.latency = latency
-            self._restart.set()
-
     async def _supervise(self):
         backoff = 0.5
         while True:
@@ -146,7 +137,7 @@ class Receiver:
             started = time.monotonic()
             try:
                 self.proc = await asyncio.create_subprocess_exec(
-                    str(RECEIVER_BIN), "--latency", str(self.latency), "--node", NODE_NAME,
+                    str(RECEIVER_BIN), "--latency", str(LATENCY_MS), "--node", NODE_NAME,
                     "--description", NODE_DESCRIPTION, "--clock", str(STATE_DIR / "clock"),
                     "--stats", str(RUNTIME_DIR / "rx.stats"),
                     "--aec", "on" if self.echo else "off", "--control",
@@ -157,19 +148,10 @@ class Receiver:
                 await asyncio.sleep(10)
                 continue
             self._set_status("up")
-            log(f"receiver: started (target latency {self.latency} ms)")
+            log(f"receiver: started (target latency {LATENCY_MS} ms)")
             tail = collections.deque(maxlen=20)
             drain = asyncio.create_task(self._drain(self.proc.stderr, tail))
-            exited = asyncio.create_task(self.proc.wait())
-            restart = asyncio.create_task(self._restart.wait())
-            done, _ = await asyncio.wait({exited, restart}, return_when=asyncio.FIRST_COMPLETED)
-            if restart in done:
-                self._restart.clear()
-                await self._terminate()
-                drain.cancel()
-                backoff = 0.5
-                continue
-            restart.cancel()
+            await self.proc.wait()
             await drain
             log(f"receiver: exited with {self.proc.returncode}: {' | '.join(tail)[-500:]}")
             self._set_status("down")
@@ -217,9 +199,6 @@ class Daemon:
         self.state = load_state()
         if "pc_id" not in self.state:
             self.update_state(pc_id=secrets.token_hex(8))
-        self.mode = self.state.get("mode", DEFAULT_MODE)
-        if self.mode not in LATENCY_MS:
-            self.mode = DEFAULT_MODE
         self.echo = bool(self.state.get("echo", False))  # remove this PC's speakers from the mic
         # The daemon owns mute: it survives receiver restarts and is re-applied to a new node.
         self.want_muted = bool(self.state.get("muted", False))
@@ -308,7 +287,7 @@ class Daemon:
     # -- control channel
 
     def state_message(self):
-        return {"t": "state", "receiver": self.receiver.status, "mode": self.mode, "echo": self.echo,
+        return {"t": "state", "receiver": self.receiver.status, "echo": self.echo,
                 "muted": self.want_muted, "mute_seq": self.mute_seq, **self.pc}
 
     async def push_state(self):
@@ -447,12 +426,6 @@ class Daemon:
             self.client_prefs["default"] = bool(prefs["default"])
             async with self._lock:
                 await self._set_default(self.client_prefs["default"])
-        mode = prefs.get("mode")
-        if mode in LATENCY_MS and mode != self.mode:
-            self.mode = mode
-            self.update_state(mode=mode)
-            self.receiver.set_latency(LATENCY_MS[mode])
-            await self.push_state()
         if "echo" in prefs and bool(prefs["echo"]) != self.echo:
             self.echo = bool(prefs["echo"])
             self.update_state(echo=self.echo)
@@ -514,7 +487,7 @@ class Daemon:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop.set)
 
-        self.receiver.start(LATENCY_MS[self.mode], self.echo)
+        self.receiver.start(self.echo)
         server = await asyncio.start_server(self.handle_client, "0.0.0.0", CONTROL_PORT,
                                             limit=MAX_LINE)
         await loop.create_datagram_endpoint(
@@ -551,7 +524,6 @@ def main():
         state = load_state()
         paired = state.get("paired")
         print(f"paired: {paired['name'] if paired else 'none'}")
-        print(f"mode: {state.get('mode', DEFAULT_MODE)}")
         print(f"echo cancellation: {'on' if state.get('echo') else 'off'}")
     else:
         print(__doc__.strip())

@@ -107,9 +107,7 @@ private fun App() {
                     last = now
                     status.refresh()
                     val rms = normalize(status.rms)
-                    val peak = normalize(status.peak)
                     meters.rms.floatValue = rms
-                    meters.peak.floatValue = peak
                     // Clip flash eases out rather than blinking off.
                     val clipTarget = if (status.clipping) 1f else 0f
                     meters.clipping.floatValue += (clipTarget - meters.clipping.floatValue) * (1 - exp(-dt / 0.08f))
@@ -159,9 +157,7 @@ private fun App() {
             runtime = runtime,
             diagnostics = diag,
             onDismiss = { showSettings = false },
-            onLatency = { scope.launch { settings.setLatency(it) } },
             onSmartStandby = { scope.launch { settings.setSmartStandby(it) } },
-            onRumble = { scope.launch { settings.setRumble(it) } },
             onLevelControl = { scope.launch { settings.setLevelControl(it) } },
             onEchoCancel = { scope.launch { settings.setEchoCancel(it) } },
             onDefaultMic = { scope.launch { settings.setDefaultMic(it) } },

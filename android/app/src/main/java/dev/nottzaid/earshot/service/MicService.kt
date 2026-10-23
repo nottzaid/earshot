@@ -21,7 +21,7 @@ import androidx.lifecycle.lifecycleScope
 import dev.nottzaid.earshot.MainActivity
 import dev.nottzaid.earshot.R
 import dev.nottzaid.earshot.audio.EngineStatus
-import dev.nottzaid.earshot.audio.LatencyMode
+import dev.nottzaid.earshot.audio.Link
 import dev.nottzaid.earshot.audio.Mic
 import dev.nottzaid.earshot.audio.Mics
 import dev.nottzaid.earshot.audio.NativeEngine
@@ -66,7 +66,6 @@ import kotlin.math.abs
 private data class EngineConfig(
     val host: String,
     val micId: Int,
-    val latency: LatencyMode,
 )
 
 class MicService : LifecycleService() {
@@ -162,7 +161,6 @@ class MicService : LifecycleService() {
                 Earshot.update { it.copy(muted = p.muted) }
                 NativeEngine.setGainDb(p.effectiveGainDb)
                 NativeEngine.setMuted(p.muted)
-                NativeEngine.setHighPass(p.rumbleFilter)
             }
         }
 
@@ -230,9 +228,9 @@ class MicService : LifecycleService() {
 
         // Settings the PC needs to hear about.
         lifecycleScope.launch {
-            prefs.filterNotNull().map { Triple(it.latency, it.defaultMic, it.echoCancel) }.distinctUntilChanged()
-                .collect { (lat, def, echo) ->
-                    outgoing.trySend(jsonOf("t" to "set", "mode" to lat.key, "default" to def, "echo" to echo))
+            prefs.filterNotNull().map { it.defaultMic to it.echoCancel }.distinctUntilChanged()
+                .collect { (def, echo) ->
+                    outgoing.trySend(jsonOf("t" to "set", "default" to def, "echo" to echo))
                 }
         }
     }
@@ -243,7 +241,7 @@ class MicService : LifecycleService() {
         val host = pc?.address ?: engineConfig?.host ?: return null
         if (p.smartStandby && !listening) return null
         val mic = Mics.resolve(mics, p.micKey) ?: return null
-        return EngineConfig(host, mic.id, p.latency)
+        return EngineConfig(host, mic.id)
     }
 
     private suspend fun applyEngine(cfg: EngineConfig?, force: Boolean = false) = withContext(engineThread) {
@@ -264,10 +262,9 @@ class MicService : LifecycleService() {
         val p = settings.prefs.first()
         NativeEngine.setGainDb(p.effectiveGainDb)
         NativeEngine.setMuted(p.muted)
-        NativeEngine.setHighPass(p.rumbleFilter)
         val state = NativeEngine.start(
             cfg.host, cfg.micId, CAPTURE_PRESET,
-            cfg.latency.packetUs, cfg.latency.fecSource, cfg.latency.fecRepair,
+            Link.PACKET_US, Link.FEC_SOURCE, Link.FEC_REPAIR,
         )
         if (destroyed) {
             NativeEngine.stop()
@@ -348,7 +345,7 @@ class MicService : LifecycleService() {
         val p = settings.prefs.first()
         val hello = jsonOf(
             "t" to "hello", "v" to PROTO_VERSION, "id" to deviceId, "name" to deviceName(),
-            "prefs" to jsonOf("mode" to p.latency.key, "default" to p.defaultMic, "echo" to p.echoCancel),
+            "prefs" to jsonOf("default" to p.defaultMic, "echo" to p.echoCancel),
         )
         while (outgoing.tryReceive().isSuccess) Unit // drop anything queued for a previous session
         var avgRtt = -1f
