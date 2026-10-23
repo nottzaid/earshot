@@ -45,47 +45,8 @@ STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
 STATE_FILE = STATE_DIR / "state.json"
 RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "earshot"
 
-RECEIVER_CONF = """\
-context.properties = {{ core.daemon = false  log.level = 2 }}
-context.spa-libs = {{
-    audio.convert.* = audioconvert/libspa-audioconvert
-    support.*       = support/libspa-support
-}}
-context.modules = [
-    {{ name = libpipewire-module-rt  args = {{ nice.level = -11 rt.prio = 88 }}  flags = [ ifexists nofail ] }}
-    {{ name = libpipewire-module-protocol-native }}
-    {{ name = libpipewire-module-client-node }}
-    {{ name = libpipewire-module-adapter }}
-    {{ name = libpipewire-module-roc-source
-        args = {{
-            local.ip = 0.0.0.0
-            local.source.port = 10001
-            local.repair.port = 10002
-            local.control.port = 10003
-            fec.code = rs8m
-            sess.latency.msec = {latency}
-            # speex: unity gain and clean output; the builtin resampler measured +1 dB.
-            roc.resampler.backend = speex
-            roc.resampler.profile = high
-            # gradual: drift correction without the audible steps of 'responsive'.
-            roc.latency-tuner.profile = gradual
-            audio.position = [ MONO ]
-            source.name = {node}
-            source.props = {{
-                node.name = {node}
-                node.description = "{description}"
-                media.class = Audio/Source
-                audio.rate = 48000
-                node.latency = 256/48000
-                device.icon-name = phone
-                # never become the default mic on its own; only when the phone asks
-                priority.session = 100
-                priority.driver = 100
-            }}
-        }}
-    }}
-]
-"""
+# The receiver: ROC decoding with Earshot's own steady clock matching (see earshot-rx.c).
+RECEIVER_BIN = Path(__file__).resolve().parent / "earshot-rx"
 
 
 def log(*args):
@@ -147,7 +108,7 @@ def app_label(output):
 # ---------------------------------------------------------------- receiver
 
 class Receiver:
-    """Owns the `pipewire -c receiver.conf` child that hosts the ROC source node."""
+    """Owns the earshot-rx child that hosts the phone's source node."""
 
     def __init__(self, on_change):
         self.latency = LATENCY_MS[DEFAULT_MODE]
@@ -169,14 +130,19 @@ class Receiver:
     async def _supervise(self):
         backoff = 0.5
         while True:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
             RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-            conf = RUNTIME_DIR / "receiver.conf"
-            conf.write_text(RECEIVER_CONF.format(
-                latency=self.latency, node=NODE_NAME, description=NODE_DESCRIPTION))
             started = time.monotonic()
-            self.proc = await asyncio.create_subprocess_exec(
-                "pipewire", "-c", str(conf),
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+            try:
+                self.proc = await asyncio.create_subprocess_exec(
+                    str(RECEIVER_BIN), "--latency", str(self.latency), "--node", NODE_NAME,
+                    "--description", NODE_DESCRIPTION, "--clock", str(STATE_DIR / "clock"),
+                    "--stats", str(RUNTIME_DIR / "rx.stats"),
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+            except OSError as e:
+                log(f"receiver: can't start {RECEIVER_BIN} ({e}); build it with `make -C pc`")
+                await asyncio.sleep(10)
+                continue
             self._set_status("up")
             log(f"receiver: started (target latency {self.latency} ms)")
             tail = collections.deque(maxlen=20)

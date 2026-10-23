@@ -3,8 +3,8 @@
 Your phone's microphone, on your Linux PC, over Wi-Fi.
 
 The phone captures in Android's low-latency path and streams uncompressed 48 kHz audio with
-forward error correction ([ROC](https://roc-streaming.org)). On the PC, PipeWire's ROC module
-turns the stream into an ordinary mic called **Earshot** that any app can use. A small daemon
+forward error correction ([ROC](https://roc-streaming.org)). On the PC, `earshot-rx` decodes
+it with ROC and turns it into an ordinary mic called **Earshot** that any app can use. A small daemon
 keeps a control channel with the phone, so the app knows which PC apps are listening and
 mute and default-mic stay in sync both ways.
 
@@ -16,12 +16,14 @@ mute and default-mic stay in sync both ways.
 | `native/es_link.{h,c}` | The ROC sender, shared by the app and the PC test tool |
 | `native/build-roc-android.sh` | Builds roc-toolkit 0.4.0 for arm64 Android and installs it into the app |
 | `pc/earshotd` | PC daemon: receiver, discovery, pairing, control channel |
+| `pc/earshot-rx.c` | The receiver: ROC decoding, steady clock matching, the PipeWire node |
 | `pc/earshotd.service` | systemd user unit |
 | `tools/` | Loopback test sender and recording analysis used to tune the receiver |
 
 ## PC
 
-Needs `pipewire-roc` (pulls in `roc-toolkit`). Then run `pc/earshotd`, or install the user unit.
+Needs `roc-toolkit` and PipeWire's headers. Build the receiver with `make -C pc`, then run
+`pc/earshotd`, or install the user unit.
 
 Open these from your LAN only: UDP 10001-10003 (audio, repair, RTCP), UDP 10005 (discovery),
 TCP 10004 (control).
@@ -71,6 +73,17 @@ Release builds are signed with the key named in `android/keystore.properties` (n
 | Balanced | 50 ms | 2.5 ms | 10 + 5 |
 | Steady | 100 ms | 5 ms | 10 + 6 |
 
-The receiver uses ROC's speex resampler and its `gradual` latency tuner. In loopback tests the
-built-in resampler added about +1 dB of gain, and `responsive` tuning added audible steps
-(windows at −37 dB THD+N, against −90 dB with `gradual`).
+### Clock matching
+
+The phone's clock and the PC's never tick at quite the same rate (tens of ppm apart), so the
+receiver has to resample. ROC's own latency tuner does this by reacting to the jitter buffer,
+and every Wi-Fi hiccup made it speed up or slow down: the phone-to-PC delay ramped and jumped by
+milliseconds, which an echo canceller can't follow (`responsive` was worse still, with audible
+steps). `earshot-rx` runs ROC with tuning off and resamples in PipeWire instead. It reads the
+queue at the moment each packet lands and keeps only the peak per second; late packets only
+lower readings, so jitter never moves the peak. The clock ratio is the slope of those peaks
+over the last 30 s, with the receiver's own corrections added back so it never chases itself,
+and the delay is left wherever the stream settled (the queue is only eased back if it wanders
+a quarter of the buffer away). Once locked, the delay holds to a sample or two on real Wi-Fi.
+The ratio is saved in `~/.local/state/earshot/clock`, so the next stream starts locked; without
+it, locking takes about 30 s. Live numbers: `$XDG_RUNTIME_DIR/earshot/rx.stats`.
