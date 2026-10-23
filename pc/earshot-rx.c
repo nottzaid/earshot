@@ -179,6 +179,7 @@ static struct {
     _Atomic double st_err, st_corr, st_integ;
     atomic_int st_state;            // 0 idle, 1 settling, 2 locked
     atomic_uint st_skips, st_windows, st_late, st_slow, st_gaps;
+    atomic_uint st_gap_len, st_pop_fail; // the latest gap's length in samples; decoder pops that failed
     _Atomic double st_erle;         // mic over output power, last second, dB
     atomic_int st_aec;              // the RT thread's aec_state
     int64_t last_cycle;
@@ -359,16 +360,20 @@ static void pop(float* dst, uint32_t n) {
     while (n) {
         uint32_t k = n < MAX_POP ? n : MAX_POP;
         roc_frame f = { dst, k * sizeof(float) };
-        if (roc_receiver_decoder_pop_frame(g.active->dec, &f) != 0)
+        if (roc_receiver_decoder_pop_frame(g.active->dec, &f) != 0) {
             memset(dst, 0, k * sizeof(float));
+            atomic_fetch_add(&g.st_pop_fail, 1);
+        }
         if (g.started) {
             for (uint32_t i = 0; i < k; i++) {
                 if (dst[i] == 0.0f) {
                     g.hole++;
                     continue;
                 }
-                if (g.hole >= GAP_MIN && g.hole < GAP_MAX)
+                if (g.hole >= GAP_MIN && g.hole < GAP_MAX) {
                     atomic_fetch_add(&g.st_gaps, 1);
+                    atomic_store(&g.st_gap_len, g.hole);
+                }
                 g.hole = 0;
             }
         }
@@ -793,7 +798,7 @@ static void ref_connect(void) {
         PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Capture", PW_KEY_MEDIA_ROLE, "DSP",
         PW_KEY_STREAM_CAPTURE_SINK, "true", // the default output, following it when it changes
         PW_KEY_NODE_GROUP, "earshot",        // scheduled with the mic, on the same clock
-        PW_KEY_NODE_LATENCY, "256/48000", PW_KEY_NODE_RATE, "1/48000", NULL);
+        PW_KEY_NODE_LATENCY, "128/48000", PW_KEY_NODE_RATE, "1/48000", NULL);
     g.ref_stream = pw_stream_new(g.core, "Earshot speakers", props);
     if (!g.ref_stream)
         return;
@@ -940,13 +945,14 @@ static void on_tick(void* data, uint64_t expirations) {
         FILE* f = fopen(g.stats_path, ticks % 3600 == 0 ? "w" : "a"); // keeps the last hour or so
         if (f) {
             fprintf(f, "%.3f state=%d err=%.1f corr_ppm=%.3f ratio_ppm=%.3f skips=%u gaps=%u late=%u slow=%u max_us=%.0f"
-                    " aec=%d delay=%d reduction_db=%.1f mic_ahead=%lld\n",
+                    " aec=%d delay=%d reduction_db=%.1f mic_ahead=%lld gap_len=%u pop_fail=%u\n",
                     (double)now_ns() / 1e9, atomic_load(&g.st_state), atomic_load(&g.st_err),
                     atomic_load(&g.st_corr) * 1e6, atomic_load(&g.st_integ) * 1e6,
                     atomic_load(&g.st_skips), atomic_load(&g.st_gaps),
                     atomic_load(&g.st_late), atomic_load(&g.st_slow), (double)atomic_load(&g.st_max_ns) / 1e3,
                     atomic_load(&g.st_aec), atomic_load(&g.aec_delay) + AEC_MARGIN, atomic_load(&g.st_erle),
-                    (long long)(atomic_load(&g.mic_end) - atomic_load(&g.ref_end)));
+                    (long long)(atomic_load(&g.mic_end) - atomic_load(&g.ref_end)), atomic_load(&g.st_gap_len),
+                    atomic_load(&g.st_pop_fail));
             fclose(f);
         }
     }
@@ -1035,7 +1041,7 @@ int main(int argc, char** argv) {
 
     struct pw_properties* props = pw_properties_new(
         PW_KEY_NODE_NAME, g.node, PW_KEY_NODE_DESCRIPTION, g.description,
-        PW_KEY_MEDIA_CLASS, "Audio/Source", PW_KEY_NODE_LATENCY, "256/48000",
+        PW_KEY_MEDIA_CLASS, "Audio/Source", PW_KEY_NODE_LATENCY, "128/48000",
         PW_KEY_NODE_RATE, "1/48000", PW_KEY_DEVICE_ICON_NAME, "phone",
         PW_KEY_NODE_GROUP, "earshot",
         // never become the default mic on its own; only when the phone asks
