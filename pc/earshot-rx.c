@@ -70,6 +70,8 @@
 #define MAX_LAG 12000                // search up to 250 ms
 #define RECHECK_S 15
 #define ZERO_RUN 32                  // this many exact zeros in a row: the mic is off or muted
+#define GAP_MIN 16                   // a hole of exact zeros this long or longer, but shorter
+#define GAP_MAX (RATE / 10)          // than this, is the decoder concealing a missing packet
 
 enum { AEC_OFF, AEC_ACQUIRE, AEC_RUN };
 
@@ -99,6 +101,7 @@ static struct {
     const char* stats_path;
     int port;
     int dump_fd;                    // debug: mic and output pairs, EARSHOT_RX_DUMP
+    int jitter_fd;                  // debug: each source packet's arrival, EARSHOT_RX_JITTER
 
     roc_context* roc;
     int fd_source, fd_repair, fd_control;
@@ -118,6 +121,7 @@ static struct {
     struct epoch* to_retire;
     bool started;                   // decoder has begun producing audio
     int64_t popped;                 // phone samples taken from the active decoder
+    uint32_t hole;                  // exact zeros in a row at the end of the last pop
     uint32_t win_out;               // output samples into the current window
     int settle;                     // windows of reference still to gather
     double ref;                     // queue reading the loop holds
@@ -173,7 +177,7 @@ static struct {
     // published for the stats writer
     _Atomic double st_err, st_corr, st_integ;
     atomic_int st_state;            // 0 idle, 1 settling, 2 locked
-    atomic_uint st_skips, st_windows, st_late, st_slow;
+    atomic_uint st_skips, st_windows, st_late, st_slow, st_gaps;
     _Atomic double st_erle;         // mic over output power, last second, dB
     atomic_int st_aec;              // the RT thread's aec_state
     int64_t last_cycle;
@@ -294,6 +298,13 @@ static void on_source_packet(const uint8_t* p, size_t n) {
             int64_t r = (int64_t)(reading * 256.0), cur = atomic_load(&e->peak);
             while (r > cur && !atomic_compare_exchange_weak(&e->peak, &cur, r))
                 ;
+            if (g.jitter_fd >= 0) {
+                // (arrival, this packet's end minus the play position, seq, length)
+                struct { int64_t t; double reading; uint32_t seq, len; } rec = {
+                    now_ns(), reading, seq, e->pkt_samples };
+                if (write(g.jitter_fd, &rec, sizeof(rec)) < 0)
+                    g.jitter_fd = -1;
+            }
         }
     }
 
@@ -349,6 +360,17 @@ static void pop(float* dst, uint32_t n) {
         roc_frame f = { dst, k * sizeof(float) };
         if (roc_receiver_decoder_pop_frame(g.active->dec, &f) != 0)
             memset(dst, 0, k * sizeof(float));
+        if (g.started) {
+            for (uint32_t i = 0; i < k; i++) {
+                if (dst[i] == 0.0f) {
+                    g.hole++;
+                    continue;
+                }
+                if (g.hole >= GAP_MIN && g.hole < GAP_MAX)
+                    atomic_fetch_add(&g.st_gaps, 1);
+                g.hole = 0;
+            }
+        }
         if (!g.started) {
             for (uint32_t i = 0; i < k; i++)
                 if (dst[i] != 0.0f) {
@@ -418,6 +440,7 @@ static inline float rs_at(double c) {
 static void reset_loop_state(void) {
     g.started = false;
     g.popped = 0;
+    g.hole = 0;
     g.win_out = 0;
     g.settle = SETTLE_WINDOWS;
     g.ref = 0;
@@ -915,11 +938,11 @@ static void on_tick(void* data, uint64_t expirations) {
     if (g.stats_path) {
         FILE* f = fopen(g.stats_path, ticks % 3600 == 0 ? "w" : "a"); // keeps the last hour or so
         if (f) {
-            fprintf(f, "%.3f state=%d err=%.1f corr_ppm=%.3f ratio_ppm=%.3f skips=%u late=%u slow=%u max_us=%.0f"
+            fprintf(f, "%.3f state=%d err=%.1f corr_ppm=%.3f ratio_ppm=%.3f skips=%u gaps=%u late=%u slow=%u max_us=%.0f"
                     " aec=%d delay=%d reduction_db=%.1f mic_ahead=%lld\n",
                     (double)now_ns() / 1e9, atomic_load(&g.st_state), atomic_load(&g.st_err),
                     atomic_load(&g.st_corr) * 1e6, atomic_load(&g.st_integ) * 1e6,
-                    atomic_load(&g.st_skips),
+                    atomic_load(&g.st_skips), atomic_load(&g.st_gaps),
                     atomic_load(&g.st_late), atomic_load(&g.st_slow), (double)atomic_load(&g.st_max_ns) / 1e3,
                     atomic_load(&g.st_aec), atomic_load(&g.aec_delay) + AEC_MARGIN, atomic_load(&g.st_erle),
                     (long long)(atomic_load(&g.mic_end) - atomic_load(&g.ref_end)));
@@ -966,6 +989,8 @@ int main(int argc, char** argv) {
     load_clock();
     const char* dump = getenv("EARSHOT_RX_DUMP");
     g.dump_fd = dump ? open(dump, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644) : -1;
+    const char* jitter = getenv("EARSHOT_RX_JITTER");
+    g.jitter_fd = jitter ? open(jitter, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644) : -1;
     g.step = 1.0 + g.integ;
     rs_init();
     g.aec = aec_new();
