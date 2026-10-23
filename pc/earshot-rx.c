@@ -2,13 +2,20 @@
 //
 // ROC decodes the phone's packets and repairs losses, with its own clock correction off:
 // its tuner reacts to every network hiccup, so the phone-to-PC delay kept ramping and
-// jumping, which an echo canceller can't follow. Here the phone's clock is matched by
-// PipeWire's resampler instead, steered by a deliberately slow loop that watches how full
-// the packet queue gets when packets arrive on time. Late packets never move it, so the
-// delay holds still to within a few samples once locked, and the learned clock ratio is
-// kept across runs so the next stream starts locked.
+// jumping, which an echo canceller can't follow. Here the phone's clock is matched by our own
+// resampler, steered by a deliberately slow estimate of the clock ratio taken from how full
+// the packet queue gets when packets arrive on time. Late packets never move it, so the delay
+// holds still to within a sample or two once locked, and the ratio is kept across runs so the
+// next stream starts locked.
 //
-//   earshot-rx --latency MS [--node NAME] [--description TEXT] [--clock FILE] [--stats FILE] [--port BASE]
+// With echo cancellation on, the PC's speaker output is captured too (same graph, same clock)
+// and what it put into the phone's mic is subtracted (aec.c); nothing else changes.
+//
+//   earshot-rx --latency MS [--node NAME] [--description TEXT] [--clock FILE] [--stats FILE]
+//              [--port BASE] [--aec on|off] [--control]
+//   --control: read commands from stdin ("aec on", "aec off"); exit when it closes.
+
+#include "aec.h"
 
 #include <pipewire/pipewire.h>
 #include <spa/param/audio/format-utils.h>
@@ -52,6 +59,20 @@
 #define CORR_MAX 1e-3                // the loop never asks for more than 1000 ppm
 #define SKIP_FADE 256                // crossfade length of an emergency latency cut
 
+// Resampler: Kaiser-windowed sinc, 48 taps (0.5 ms of lookahead), 256 phases interpolated.
+#define RS_HALF 24
+#define RS_PHASES 256
+#define FIFO (1 << 16)               // phone samples held for the resampler
+
+// Echo cancellation runs on PC-clock samples addressed by the graph's tick counter.
+#define RING (1 << 18)               // 5.4 s of speaker output and resampled mic
+#define ACQ_LEN (1 << 17)            // 2.7 s per delay measurement
+#define MAX_LAG 12000                // search up to 250 ms
+#define RECHECK_S 15
+#define ZERO_RUN 32                  // this many exact zeros in a row: the mic is off or muted
+
+enum { AEC_OFF, AEC_ACQUIRE, AEC_RUN };
+
 // One decoder per stream from the phone (a new SSRC means the phone restarted its sender).
 struct epoch {
     roc_receiver_decoder* dec;
@@ -77,7 +98,7 @@ static struct {
     const char* clock_path;
     const char* stats_path;
     int port;
-    int dump_fd;                    // debug: raw output, EARSHOT_RX_DUMP
+    int dump_fd;                    // debug: mic and output pairs, EARSHOT_RX_DUMP
 
     roc_context* roc;
     int fd_source, fd_repair, fd_control;
@@ -111,14 +132,50 @@ static struct {
     int warmup;
     int over_windows;
     uint32_t skip;                  // samples to cut on the next cycle
-    double rate;                    // what the resampler is told
-    float scratch[2 * MAX_POP];
-    float skipbuf[RATE / 2 + MAX_POP];
+    double step;                    // phone samples per output sample (1 + corr)
+
+    // resampler: in[] holds phone samples from index in_base on; pos is the next output's
+    // position in that same phone-sample count
+    float in[FIFO];
+    int64_t in_base, in_end;
+    double pos;
+    float rs_table[RS_PHASES + 1][2 * RS_HALF];
+
+    // echo cancellation (RT side)
+    struct pw_context* context;
+    struct pw_core* core;
+    struct spa_hook stream_listener, ref_listener, core_listener;
+    struct pw_stream* ref_stream;
+    bool streaming;                 // someone is listening to the mic
+    atomic_int aec_want;            // AEC_OFF or AEC_ACQUIRE (set by the main thread)
+    int aec_state;                  // RT copy
+    atomic_int aec_delay;           // filter's first lag, set by the main thread
+    atomic_bool aec_new_delay;
+    int aec_d;
+    aec* aec;
+    float ref_ring[RING], mic_ring[RING];
+    _Atomic int64_t ref_end, mic_end; // graph tick after the last sample written (mic's count)
+    // Each stream counts ticks from its own start, so the speaker stream's are mapped onto the
+    // mic's through the cycle time both streams see.
+    int64_t ref_now, ref_ticks;     // the speaker stream's last cycle
+    int64_t tick_offset;            // mic ticks minus speaker ticks
+    bool offset_known;
+    int64_t blk_start;              // tick of the block in progress (-1: none)
+    float pred[AEC_N], err[AEC_N];
+    bool blk_learn;
+    int zero_run;
+
+    // echo cancellation (main thread side)
+    float acq_ref[ACQ_LEN], acq_mic[ACQ_LEN];
+    int recheck_in, recheck_miss;
+    bool control;
 
     // published for the stats writer
     _Atomic double st_err, st_corr, st_integ;
     atomic_int st_state;            // 0 idle, 1 settling, 2 locked
     atomic_uint st_skips, st_windows, st_late, st_slow;
+    _Atomic double st_erle;         // mic over output power, last second, dB
+    atomic_int st_aec;              // the RT thread's aec_state
     int64_t last_cycle;
     _Atomic int64_t st_max_ns;
 } g = { .fd_source = -1, .fd_repair = -1, .fd_control = -1 };
@@ -292,10 +349,70 @@ static void pop(float* dst, uint32_t n) {
         roc_frame f = { dst, k * sizeof(float) };
         if (roc_receiver_decoder_pop_frame(g.active->dec, &f) != 0)
             memset(dst, 0, k * sizeof(float));
+        if (!g.started) {
+            for (uint32_t i = 0; i < k; i++)
+                if (dst[i] != 0.0f) {
+                    g.started = true;
+                    atomic_store(&g.active->peak, INT64_MIN); // readings so far predate playback
+                    break;
+                }
+        }
         dst += k;
         n -= k;
         g.popped += k;
     }
+}
+
+static double bessel_i0(double x) {
+    double sum = 1, term = 1;
+    for (int k = 1; k < 50; k++) {
+        term *= (x / (2 * k)) * (x / (2 * k));
+        sum += term;
+    }
+    return sum;
+}
+
+static void rs_init(void) {
+    const double beta = 9.0;
+    for (int p = 0; p <= RS_PHASES; p++) {
+        double f = (double)p / RS_PHASES, h[2 * RS_HALF], sum = 0;
+        for (int t = 0; t < 2 * RS_HALF; t++) {
+            double x = (t - RS_HALF + 1) - f; // tap t multiplies in[i + t - RS_HALF + 1]
+            double r = x / RS_HALF;
+            double w = fabs(r) >= 1 ? 0 : bessel_i0(beta * sqrt(1 - r * r)) / bessel_i0(beta);
+            h[t] = (fabs(x) < 1e-12 ? 1 : sin(M_PI * x) / (M_PI * x)) * w;
+            sum += h[t];
+        }
+        for (int t = 0; t < 2 * RS_HALF; t++)
+            g.rs_table[p][t] = (float)(h[t] / sum);
+    }
+}
+
+// Make in[] hold phone samples up to `end`, dropping what lies before `keep` to make room.
+static void rs_need(int64_t end, int64_t keep) {
+    if (end <= g.in_end)
+        return;
+    if (end - g.in_base > FIFO && keep > g.in_base) {
+        memmove(g.in, g.in + (keep - g.in_base), (size_t)(g.in_end - keep) * sizeof(float));
+        g.in_base = keep;
+    }
+    if (end - g.in_base > FIFO) // can't happen with cuts capped at half a second; never overrun
+        return;
+    pop(g.in + (g.in_end - g.in_base), (uint32_t)(end - g.in_end));
+    g.in_end = end;
+}
+
+static inline float rs_at(double c) {
+    int64_t i = (int64_t)floor(c);
+    float fp = (float)(c - (double)i) * RS_PHASES;
+    int p = (int)fp;
+    float a = fp - (float)p;
+    const float *h0 = g.rs_table[p], *h1 = g.rs_table[p + 1];
+    const float* x = g.in + (i - RS_HALF + 1 - g.in_base);
+    float acc = 0;
+    for (int t = 0; t < 2 * RS_HALF; t++)
+        acc += x[t] * (h0[t] + a * (h1[t] - h0[t]));
+    return acc;
 }
 
 static void reset_loop_state(void) {
@@ -311,7 +428,9 @@ static void reset_loop_state(void) {
     g.warmup = g.learned ? WARMUP_WINDOWS : 0;
     g.applied = 0;
     g.corr = g.integ;
-    g.rate = 1.0 / (1.0 + g.corr);
+    g.step = 1.0 + g.corr;
+    g.in_base = g.in_end = 0;
+    g.pos = RS_HALF - 1; // the first output needs phone samples 0 .. 2 RS_HALF - 1
     atomic_store(&g.st_state, g.active ? 1 : 0);
 }
 
@@ -396,7 +515,46 @@ apply:;
     atomic_store(&g.st_err, err);
     atomic_store(&g.st_corr, g.corr);
     atomic_store(&g.st_integ, g.integ);
-    g.rate = 1.0 / (1.0 + g.corr);
+    g.step = 1.0 + g.corr;
+}
+
+// One mic sample at graph tick t: subtract the predicted echo, block by block.
+static inline float cancel(int64_t t, float mic) {
+    g.mic_ring[t & (RING - 1)] = mic;
+    if (g.aec_state != AEC_RUN)
+        return mic;
+    int ph = (int)(t % AEC_N);
+    if (ph == 0) {
+        g.blk_start = -1;
+        int64_t from = t - g.aec_d;
+        if (from + AEC_N <= atomic_load_explicit(&g.ref_end, memory_order_acquire)) {
+            float r[AEC_N], e = 0;
+            for (int i = 0; i < AEC_N; i++) {
+                r[i] = g.ref_ring[(from + i) & (RING - 1)];
+                e += r[i] * r[i];
+            }
+            aec_predict(g.aec, r, g.pred);
+            g.blk_start = t;
+            g.blk_learn = e > AEC_N * 1e-7f; // nothing to learn while the speakers are silent
+        }
+    }
+    if (g.blk_start < 0)
+        return mic; // no prediction for this block: it started mid-block, or no reference yet
+    float out = mic - g.pred[ph];
+    g.err[ph] = out;
+    if (mic == 0.0f) {
+        if (++g.zero_run >= ZERO_RUN) { // the phone sends silence (muted, or its mic taken)
+            g.blk_learn = false;
+            out = 0.0f;
+        }
+    } else {
+        g.zero_run = 0;
+    }
+    if (ph == AEC_N - 1) {
+        aec_update(g.aec, g.err, g.blk_learn);
+        g.blk_start = -1;
+    }
+    return out;
 }
 
 static void on_process(void* data) {
@@ -417,6 +575,19 @@ static void on_process(void* data) {
         n = d->maxsize / sizeof(float);
     if (n > MAX_POP)
         n = MAX_POP;
+    struct pw_time tm;
+    bool timed = pw_stream_get_time_n(g.stream, &tm, sizeof(tm)) == 0 && tm.rate.denom == RATE;
+    int64_t T = (int64_t)tm.ticks;
+    if (timed && g.ref_now) {
+        int64_t off = T - g.ref_ticks - llround((double)(tm.now - g.ref_now) * RATE / 1e9);
+        if (!g.offset_known || off != g.tick_offset) {
+            g.tick_offset = off;          // first sight, or the speaker stream restarted
+            g.offset_known = true;
+            atomic_store(&g.ref_end, 0);  // what was written under the old mapping is unusable
+            if (g.aec_state == AEC_RUN)
+                g.aec_state = AEC_ACQUIRE;
+        }
+    }
 
     struct epoch* fresh = atomic_exchange_explicit(&g.pending, NULL, memory_order_acquire);
     if (fresh) {
@@ -424,6 +595,8 @@ static void on_process(void* data) {
             g.to_retire = g.active; // a third epoch before the second is freed is not realistic
         g.active = fresh;
         reset_loop_state();
+        if (g.aec_state == AEC_RUN)
+            g.aec_state = AEC_ACQUIRE; // a new stream settles at a new delay
     }
     if (g.to_retire) {
         struct epoch* none = NULL;
@@ -431,34 +604,52 @@ static void on_process(void* data) {
             g.to_retire = NULL;
     }
 
+    // Echo cancellation state, as the main thread asks.
+    if (atomic_load(&g.aec_want) == AEC_OFF || !timed) {
+        g.aec_state = AEC_OFF;
+    } else {
+        if (g.aec_state == AEC_OFF)
+            g.aec_state = AEC_ACQUIRE;
+        if (atomic_exchange(&g.aec_new_delay, false)) {
+            g.aec_d = atomic_load(&g.aec_delay);
+            aec_reset(g.aec);
+            g.aec_state = AEC_RUN;
+            g.blk_start = -1;
+        }
+    }
+    if (timed && T != atomic_load_explicit(&g.mic_end, memory_order_relaxed))
+        g.blk_start = -1; // the graph skipped or restarted: blocks realign on the next boundary
+
     if (!g.active) {
         memset(dst, 0, n * sizeof(float));
-    } else if (g.skip) {
-        // Emergency cut: drop `skip` samples, crossfading across the gap.
-        uint32_t skip = g.skip;
-        g.skip = 0;
-        pop(g.skipbuf, skip + n);
-        for (uint32_t i = 0; i < n; i++) {
-            float w = i < SKIP_FADE ? 0.5f - 0.5f * cosf((float)M_PI * (float)i / SKIP_FADE) : 1.0f;
-            dst[i] = g.skipbuf[i] * (1.0f - w) + g.skipbuf[skip + i] * w;
-        }
     } else {
-        pop(dst, n);
-        if (!g.started) {
-            for (uint32_t i = 0; i < n; i++)
-                if (dst[i] != 0.0f) {
-                    g.started = true;
-                    atomic_store(&g.active->peak, INT64_MIN); // readings so far predate playback
-                    break;
-                }
+        double pos0 = g.pos;
+        if (g.skip) {
+            // Emergency cut: jump `skip` samples ahead, crossfading from the old position.
+            g.pos += g.skip;
+            if (g.aec_state == AEC_RUN)
+                g.aec_state = AEC_ACQUIRE;
         }
+        int64_t keep = (int64_t)floor(pos0 < g.pos ? pos0 : g.pos) - RS_HALF;
+        rs_need((int64_t)floor(g.pos + (n - 1) * g.step) + RS_HALF + 1, keep);
+        for (uint32_t i = 0; i < n; i++) {
+            float y = rs_at(g.pos + i * g.step);
+            if (g.skip && i < SKIP_FADE) {
+                float w = 0.5f - 0.5f * cosf((float)M_PI * (float)i / SKIP_FADE);
+                y = rs_at(pos0 + i * g.step) * (1.0f - w) + y * w;
+            }
+            dst[i] = y;
+        }
+        g.pos += n * g.step;
+        g.skip = 0;
+
         struct epoch* e = g.active;
         unsigned s0 = atomic_load_explicit(&e->seq, memory_order_relaxed);
         atomic_store_explicit(&e->seq, s0 + 1, memory_order_relaxed);
         atomic_thread_fence(memory_order_release);
         atomic_store_explicit(&e->pub_t, t_in, memory_order_relaxed);
         atomic_store_explicit(&e->pub_popped, g.popped, memory_order_relaxed);
-        atomic_store_explicit(&e->pub_rate, (double)RATE / g.rate * 1e-9, memory_order_relaxed);
+        atomic_store_explicit(&e->pub_rate, (double)RATE * g.step * 1e-9, memory_order_relaxed);
         atomic_store_explicit(&e->seq, s0 + 2, memory_order_release);
         g.win_out += n;
         if (g.win_out >= WINDOW) {
@@ -467,9 +658,36 @@ static void on_process(void* data) {
         }
     }
 
-    if (g.dump_fd >= 0 && write(g.dump_fd, dst, n * sizeof(float)) < 0)
-        g.dump_fd = -1;
-    pw_stream_set_rate(g.stream, g.rate);
+    static float raw[MAX_POP];
+    if (g.dump_fd >= 0)
+        memcpy(raw, dst, n * sizeof(float));
+    if (timed) {
+        static double in_pow, out_pow;
+        static uint32_t pow_n;
+        for (uint32_t i = 0; i < n; i++) {
+            float m = dst[i];
+            dst[i] = cancel(T + i, m);
+            in_pow += (double)m * m;
+            out_pow += (double)dst[i] * dst[i];
+        }
+        atomic_store_explicit(&g.mic_end, T + n, memory_order_release);
+        if ((pow_n += n) >= RATE) {
+            atomic_store(&g.st_erle, g.aec_state == AEC_RUN && out_pow > 0 ? 10 * log10(in_pow / out_pow) : 0);
+            in_pow = out_pow = 0;
+            pow_n = 0;
+        }
+    }
+
+    atomic_store_explicit(&g.st_aec, g.aec_state, memory_order_relaxed);
+    if (g.dump_fd >= 0) { // debug: (mic, output) pairs
+        static float pairs[2 * MAX_POP];
+        for (uint32_t i = 0; i < n; i++) {
+            pairs[2 * i] = raw[i];
+            pairs[2 * i + 1] = dst[i];
+        }
+        if (write(g.dump_fd, pairs, 2 * n * sizeof(float)) < 0)
+            g.dump_fd = -1;
+    }
     d->chunk->offset = 0;
     d->chunk->stride = sizeof(float);
     d->chunk->size = n * sizeof(float);
@@ -482,6 +700,38 @@ static void on_process(void* data) {
         atomic_fetch_add(&g.st_slow, 1);
 }
 
+// The speakers: what the default output plays, on the same graph clock as the mic.
+static void on_ref_process(void* data) {
+    (void)data;
+    struct pw_buffer* b = pw_stream_dequeue_buffer(g.ref_stream);
+    if (!b)
+        return;
+    struct spa_data* d = &b->buffer->datas[0];
+    struct pw_time tm;
+    if (pw_stream_get_time_n(g.ref_stream, &tm, sizeof(tm)) == 0 && tm.rate.denom == RATE) {
+        g.ref_now = tm.now;
+        g.ref_ticks = (int64_t)tm.ticks;
+        int64_t T = (int64_t)tm.ticks + g.tick_offset, end = atomic_load_explicit(&g.ref_end, memory_order_relaxed);
+        uint32_t n = d->chunk ? d->chunk->size / sizeof(float) : 0;
+        if (!g.offset_known)
+            n = 0;
+        if (end == 0)
+            end = T;
+        const float* src = d->data ? (const float*)((uint8_t*)d->data + d->chunk->offset) : NULL;
+        for (int64_t t = end; t < T && T - t < RING; t++)
+            g.ref_ring[t & (RING - 1)] = 0; // a gap: nothing was played
+        for (uint32_t i = 0; i < n; i++)
+            g.ref_ring[(T + i) & (RING - 1)] = src ? src[i] : 0;
+        atomic_store_explicit(&g.ref_end, T + n, memory_order_release);
+    }
+    pw_stream_queue_buffer(g.ref_stream, b);
+}
+
+static void ref_update_active(void) {
+    if (g.ref_stream)
+        pw_stream_set_active(g.ref_stream, g.streaming && atomic_load(&g.aec_want) != AEC_OFF);
+}
+
 static void on_state(void* data, enum pw_stream_state old, enum pw_stream_state state, const char* error) {
     (void)data;
     (void)old;
@@ -489,12 +739,147 @@ static void on_state(void* data, enum pw_stream_state old, enum pw_stream_state 
         fprintf(stderr, "stream error: %s\n", error ? error : "?");
         pw_main_loop_quit(g.loop);
     }
+    // Capture the speakers only while someone listens to the mic.
+    g.streaming = state == PW_STREAM_STATE_STREAMING;
+    ref_update_active();
 }
 
 static const struct pw_stream_events stream_events = {
     PW_VERSION_STREAM_EVENTS,
     .state_changed = on_state,
     .process = on_process,
+};
+
+static const struct pw_stream_events ref_events = {
+    PW_VERSION_STREAM_EVENTS,
+    .process = on_ref_process,
+};
+
+static const struct spa_pod* mono_format(struct spa_pod_builder* pb) {
+    struct spa_audio_info_raw info = { .format = SPA_AUDIO_FORMAT_F32, .rate = RATE, .channels = 1 };
+    info.position[0] = SPA_AUDIO_CHANNEL_MONO;
+    return spa_format_audio_raw_build(pb, SPA_PARAM_EnumFormat, &info);
+}
+
+static void ref_connect(void) {
+    if (g.ref_stream)
+        return;
+    struct pw_properties* props = pw_properties_new(
+        PW_KEY_NODE_NAME, "earshot.speakers", PW_KEY_NODE_DESCRIPTION, "Earshot echo reference",
+        PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Capture", PW_KEY_MEDIA_ROLE, "DSP",
+        PW_KEY_STREAM_CAPTURE_SINK, "true", // the default output, following it when it changes
+        PW_KEY_NODE_GROUP, "earshot",        // scheduled with the mic, on the same clock
+        PW_KEY_NODE_LATENCY, "256/48000", PW_KEY_NODE_RATE, "1/48000", NULL);
+    g.ref_stream = pw_stream_new(g.core, "Earshot speakers", props);
+    if (!g.ref_stream)
+        return;
+    pw_stream_add_listener(g.ref_stream, &g.ref_listener, &ref_events, NULL);
+    uint8_t pod[1024];
+    struct spa_pod_builder pb = SPA_POD_BUILDER_INIT(pod, sizeof(pod));
+    const struct spa_pod* params[1] = { mono_format(&pb) };
+    pw_stream_connect(g.ref_stream, PW_DIRECTION_INPUT, PW_ID_ANY,
+                      PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS
+                          | PW_STREAM_FLAG_INACTIVE,
+                      params, 1);
+}
+
+static void set_aec(bool on) {
+    atomic_store(&g.aec_want, on ? AEC_ACQUIRE : AEC_OFF);
+    if (on)
+        ref_connect();
+    ref_update_active();
+    fprintf(stderr, "echo cancellation %s\n", on ? "on" : "off");
+}
+
+// Bulk delay: measured from the last stretch of mic and speaker output (main thread, ~10 ms).
+static int measure_delay(void) {
+    int64_t end = atomic_load(&g.ref_end), m = atomic_load(&g.mic_end);
+    if (m < end)
+        end = m;
+    end -= 4096; // well behind what the RT thread is writing
+    if (end < ACQ_LEN)
+        return -1;
+    double e = 0;
+    for (int i = 0; i < ACQ_LEN; i++) {
+        g.acq_ref[i] = g.ref_ring[(end - ACQ_LEN + i) & (RING - 1)];
+        g.acq_mic[i] = g.mic_ring[(end - ACQ_LEN + i) & (RING - 1)];
+        e += (double)g.acq_ref[i] * g.acq_ref[i];
+    }
+    if (e < ACQ_LEN * 1e-6)
+        return -1; // the speakers were (nearly) silent: nothing to measure against
+    float q;
+    int lag = aec_find_delay(g.acq_ref, g.acq_mic, ACQ_LEN, MAX_LAG, &q);
+    return lag >= AEC_MARGIN ? lag : -1;
+}
+
+static void aec_tick(void) {
+    if (atomic_load(&g.aec_want) == AEC_OFF || !g.streaming)
+        return;
+    int state = atomic_load(&g.st_aec);
+    if (state == AEC_ACQUIRE) {
+        int lag = measure_delay();
+        if (lag >= 0) {
+            atomic_store(&g.aec_delay, lag - AEC_MARGIN);
+            atomic_store(&g.aec_new_delay, true);
+            g.recheck_in = RECHECK_S;
+            g.recheck_miss = 0;
+        }
+    } else if (state == AEC_RUN && --g.recheck_in <= 0) {
+        // The delay holds still, but a cut or a pull of the queue can move it: follow.
+        g.recheck_in = RECHECK_S;
+        int lag = measure_delay();
+        if (lag >= 0 && abs(lag - AEC_MARGIN - atomic_load(&g.aec_delay)) > 96) {
+            if (++g.recheck_miss >= 2) {
+                atomic_store(&g.aec_delay, lag - AEC_MARGIN);
+                atomic_store(&g.aec_new_delay, true);
+                g.recheck_miss = 0;
+            }
+        } else if (lag >= 0) {
+            g.recheck_miss = 0;
+        }
+    }
+}
+
+static void on_control(void* data, int fd, uint32_t mask) {
+    (void)data;
+    static char line[256];
+    static size_t len;
+    if (mask & (SPA_IO_ERR | SPA_IO_HUP)) {
+        pw_main_loop_quit(g.loop); // the daemon went away: so do we
+        return;
+    }
+    ssize_t r = read(fd, line + len, sizeof(line) - 1 - len);
+    if (r <= 0) {
+        pw_main_loop_quit(g.loop);
+        return;
+    }
+    len += (size_t)r;
+    char* nl;
+    while ((nl = memchr(line, '\n', len))) {
+        *nl = 0;
+        if (!strcmp(line, "aec on"))
+            set_aec(true);
+        else if (!strcmp(line, "aec off"))
+            set_aec(false);
+        size_t used = (size_t)(nl - line) + 1;
+        memmove(line, nl + 1, len - used);
+        len -= used;
+    }
+    if (len == sizeof(line) - 1)
+        len = 0;
+}
+
+static void on_core_error(void* data, uint32_t id, int seq, int res, const char* message) {
+    (void)data;
+    (void)seq;
+    fprintf(stderr, "pipewire: %s\n", message);
+    if (id == PW_ID_CORE && res == -EPIPE)
+        pw_main_loop_quit(g.loop); // PipeWire went away; the daemon restarts us
+}
+
+static const struct pw_core_events core_events = {
+    PW_VERSION_CORE_EVENTS,
+    .error = on_core_error,
 };
 
 static void load_clock(void) {
@@ -530,14 +915,18 @@ static void on_tick(void* data, uint64_t expirations) {
     if (g.stats_path) {
         FILE* f = fopen(g.stats_path, ticks % 3600 == 0 ? "w" : "a"); // keeps the last hour or so
         if (f) {
-            fprintf(f, "%.3f state=%d err=%.1f corr_ppm=%.3f ratio_ppm=%.3f skips=%u late=%u slow=%u max_us=%.0f\n",
+            fprintf(f, "%.3f state=%d err=%.1f corr_ppm=%.3f ratio_ppm=%.3f skips=%u late=%u slow=%u max_us=%.0f"
+                    " aec=%d delay=%d reduction_db=%.1f mic_ahead=%lld\n",
                     (double)now_ns() / 1e9, atomic_load(&g.st_state), atomic_load(&g.st_err),
                     atomic_load(&g.st_corr) * 1e6, atomic_load(&g.st_integ) * 1e6,
                     atomic_load(&g.st_skips),
-                    atomic_load(&g.st_late), atomic_load(&g.st_slow), (double)atomic_load(&g.st_max_ns) / 1e3);
+                    atomic_load(&g.st_late), atomic_load(&g.st_slow), (double)atomic_load(&g.st_max_ns) / 1e3,
+                    atomic_load(&g.st_aec), atomic_load(&g.aec_delay) + AEC_MARGIN, atomic_load(&g.st_erle),
+                    (long long)(atomic_load(&g.mic_end) - atomic_load(&g.ref_end)));
             fclose(f);
         }
     }
+    aec_tick();
     if (++ticks % 60 == 0)
         save_clock();
 }
@@ -557,7 +946,8 @@ int main(int argc, char** argv) {
         { "latency", required_argument, 0, 'l' }, { "node", required_argument, 0, 'n' },
         { "description", required_argument, 0, 'd' }, { "clock", required_argument, 0, 'c' },
         { "stats", required_argument, 0, 's' }, { "port", required_argument, 0, 'p' },
-        { 0, 0, 0, 0 } };
+        { "aec", required_argument, 0, 'a' }, { "control", no_argument, 0, 'C' }, { 0, 0, 0, 0 } };
+    bool aec_on = false;
     for (int c; (c = getopt_long(argc, argv, "", opts, NULL)) != -1;) {
         switch (c) {
         case 'l': g.latency_ms = (unsigned)atoi(optarg); break;
@@ -566,6 +956,8 @@ int main(int argc, char** argv) {
         case 'c': g.clock_path = optarg; break;
         case 's': g.stats_path = optarg; break;
         case 'p': g.port = atoi(optarg); break;
+        case 'a': aec_on = !strcmp(optarg, "on"); break;
+        case 'C': g.control = true; break;
         default: return 2;
         }
     }
@@ -574,7 +966,12 @@ int main(int argc, char** argv) {
     load_clock();
     const char* dump = getenv("EARSHOT_RX_DUMP");
     g.dump_fd = dump ? open(dump, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644) : -1;
-    g.rate = 1.0 / (1.0 + g.integ);
+    g.step = 1.0 + g.integ;
+    rs_init();
+    g.aec = aec_new();
+    g.blk_start = -1;
+    if (!g.aec)
+        return 1;
 
     roc_log_set_level(ROC_LOG_ERROR);
     roc_log_set_handler(on_roc_log, NULL);
@@ -602,21 +999,29 @@ int main(int argc, char** argv) {
     struct timespec one = { 1, 0 };
     pw_loop_update_timer(l, tick, &one, &one, false);
 
+    if (g.control)
+        pw_loop_add_io(l, STDIN_FILENO, SPA_IO_IN | SPA_IO_ERR | SPA_IO_HUP, false, on_control, NULL);
+    g.context = pw_context_new(l, NULL, 0);
+    g.core = g.context ? pw_context_connect(g.context, NULL, 0) : NULL;
+    if (!g.core)
+        return fprintf(stderr, "can't connect to PipeWire\n"), 1;
+    pw_core_add_listener(g.core, &g.core_listener, &core_events, NULL);
+
     struct pw_properties* props = pw_properties_new(
         PW_KEY_NODE_NAME, g.node, PW_KEY_NODE_DESCRIPTION, g.description,
         PW_KEY_MEDIA_CLASS, "Audio/Source", PW_KEY_NODE_LATENCY, "256/48000",
         PW_KEY_NODE_RATE, "1/48000", PW_KEY_DEVICE_ICON_NAME, "phone",
+        PW_KEY_NODE_GROUP, "earshot",
         // never become the default mic on its own; only when the phone asks
         PW_KEY_PRIORITY_SESSION, "100", PW_KEY_PRIORITY_DRIVER, "100", NULL);
-    g.stream = pw_stream_new_simple(l, "Earshot", props, &stream_events, NULL);
+    g.stream = pw_stream_new(g.core, "Earshot", props);
     if (!g.stream)
         return fprintf(stderr, "stream failed\n"), 1;
+    pw_stream_add_listener(g.stream, &g.stream_listener, &stream_events, NULL);
 
     uint8_t pod[1024];
     struct spa_pod_builder pb = SPA_POD_BUILDER_INIT(pod, sizeof(pod));
-    struct spa_audio_info_raw info = { .format = SPA_AUDIO_FORMAT_F32, .rate = RATE, .channels = 1 };
-    info.position[0] = SPA_AUDIO_CHANNEL_MONO;
-    const struct spa_pod* params[1] = { spa_format_audio_raw_build(&pb, SPA_PARAM_EnumFormat, &info) };
+    const struct spa_pod* params[1] = { mono_format(&pb) };
     if (pw_stream_connect(g.stream, PW_DIRECTION_OUTPUT, PW_ID_ANY,
                           PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS,
                           params, 1) < 0)
@@ -625,9 +1030,13 @@ int main(int argc, char** argv) {
     atomic_store(&g.running, true);
     pthread_t net;
     pthread_create(&net, NULL, net_thread, NULL);
+    if (aec_on)
+        set_aec(true);
     pw_main_loop_run(g.loop);
 
     save_clock();
+    if (g.ref_stream)
+        pw_stream_destroy(g.ref_stream);
     pw_stream_destroy(g.stream);
     atomic_store(&g.running, false);
     pthread_join(net, NULL);
@@ -636,6 +1045,9 @@ int main(int argc, char** argv) {
     epoch_close(atomic_exchange(&g.pending, NULL));
     epoch_close(atomic_exchange(&g.retired, NULL));
     roc_context_close(g.roc);
+    aec_free(g.aec);
+    pw_core_disconnect(g.core);
+    pw_context_destroy(g.context);
     pw_main_loop_destroy(g.loop);
     pw_deinit();
     return 0;

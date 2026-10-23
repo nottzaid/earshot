@@ -9,3 +9,4 @@ tools/proto-daemon.log
 pc/earshot-rx
 tools/__pycache__/
 .aec/
+pc/aec-test

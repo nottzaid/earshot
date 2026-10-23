@@ -112,15 +112,26 @@ class Receiver:
 
     def __init__(self, on_change):
         self.latency = LATENCY_MS[DEFAULT_MODE]
+        self.echo = False
         self.proc = None
         self.status = "down"
         self._on_change = on_change
         self._task = None
         self._restart = asyncio.Event()
 
-    def start(self, latency):
+    def start(self, latency, echo):
         self.latency = latency
+        self.echo = echo
         self._task = asyncio.create_task(self._supervise())
+
+    def set_echo(self, on):
+        # Applied live: the receiver keeps running and only starts or stops cancelling.
+        self.echo = on
+        if self.proc and self.proc.returncode is None and self.proc.stdin:
+            try:
+                self.proc.stdin.write(b"aec on\n" if on else b"aec off\n")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
     def set_latency(self, latency):
         if latency != self.latency:
@@ -138,7 +149,9 @@ class Receiver:
                     str(RECEIVER_BIN), "--latency", str(self.latency), "--node", NODE_NAME,
                     "--description", NODE_DESCRIPTION, "--clock", str(STATE_DIR / "clock"),
                     "--stats", str(RUNTIME_DIR / "rx.stats"),
-                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+                    "--aec", "on" if self.echo else "off", "--control",
+                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE)
             except OSError as e:
                 log(f"receiver: can't start {RECEIVER_BIN} ({e}); build it with `make -C pc`")
                 await asyncio.sleep(10)
@@ -207,6 +220,7 @@ class Daemon:
         self.mode = self.state.get("mode", DEFAULT_MODE)
         if self.mode not in LATENCY_MS:
             self.mode = DEFAULT_MODE
+        self.echo = bool(self.state.get("echo", False))  # remove this PC's speakers from the mic
         # The daemon owns mute: it survives receiver restarts and is re-applied to a new node.
         self.want_muted = bool(self.state.get("muted", False))
         self.mute_seq = 0                # last phone mute request applied (per connection)
@@ -294,7 +308,7 @@ class Daemon:
     # -- control channel
 
     def state_message(self):
-        return {"t": "state", "receiver": self.receiver.status, "mode": self.mode,
+        return {"t": "state", "receiver": self.receiver.status, "mode": self.mode, "echo": self.echo,
                 "muted": self.want_muted, "mute_seq": self.mute_seq, **self.pc}
 
     async def push_state(self):
@@ -439,6 +453,12 @@ class Daemon:
             self.update_state(mode=mode)
             self.receiver.set_latency(LATENCY_MS[mode])
             await self.push_state()
+        if "echo" in prefs and bool(prefs["echo"]) != self.echo:
+            self.echo = bool(prefs["echo"])
+            self.update_state(echo=self.echo)
+            self.receiver.set_echo(self.echo)
+            log(f"echo cancellation {'on' if self.echo else 'off'}")
+            await self.push_state()
 
     async def _set_default(self, want):
         if self.node_index is None:
@@ -494,7 +514,7 @@ class Daemon:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop.set)
 
-        self.receiver.start(LATENCY_MS[self.mode])
+        self.receiver.start(LATENCY_MS[self.mode], self.echo)
         server = await asyncio.start_server(self.handle_client, "0.0.0.0", CONTROL_PORT,
                                             limit=MAX_LINE)
         await loop.create_datagram_endpoint(
@@ -532,6 +552,7 @@ def main():
         paired = state.get("paired")
         print(f"paired: {paired['name'] if paired else 'none'}")
         print(f"mode: {state.get('mode', DEFAULT_MODE)}")
+        print(f"echo cancellation: {'on' if state.get('echo') else 'off'}")
     else:
         print(__doc__.strip())
         sys.exit(2)

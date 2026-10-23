@@ -87,3 +87,20 @@ and the delay is left wherever the stream settled (the queue is only eased back 
 a quarter of the buffer away). Once locked, the delay holds to a sample or two on real Wi-Fi.
 The ratio is saved in `~/.local/state/earshot/clock`, so the next stream starts locked; without
 it, locking takes about 30 s. Live numbers: `$XDG_RUNTIME_DIR/earshot/rx.stats`.
+
+### Echo cancellation
+
+With **Echo cancellation** on (app settings), the receiver also captures what the PC's default
+output plays, on the same graph clock as the mic, and subtracts what that sound put into the
+phone's mic. It is subtraction only: the output is the mic minus a linear prediction of the
+speaker sound, with no suppressor, gate, noise reduction or level change, so voices, a TV and
+the room come through as captured. The prediction is a frequency-domain Kalman filter over
+150 ms of echo path (`pc/aec.c`), after a bulk delay found by GCC-PHAT and rechecked every
+15 s. It adds no latency: the speaker sound reaches the mic ~60 ms after it is played, so the
+prediction is ready before the mic samples arrive.
+
+Measured on music through the PC speakers with a TV on in the room: 17-22 dB less speaker
+sound in the mic once settled (a few seconds), the TV's sound unchanged. A voice mixed into the
+mic digitally came out within 0.3 dB of itself. Sound the PC doesn't play (phone notifications,
+the TV) can't be removed this way, by design. `pc/aec-test` runs the canceller offline on a
+capture from `tools/aec-capture.sh`.
