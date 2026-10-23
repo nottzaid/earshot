@@ -38,6 +38,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -1052,9 +1053,17 @@ int main(int argc, char** argv) {
                           params, 1) < 0)
         return fprintf(stderr, "connect failed\n"), 1;
 
+    // Packets are timed by when this thread sees them, and late ones are lost: run it real-time
+    // (below PipeWire's graph thread) and keep the state both threads touch out of swap.
+    if (mlock(&g, sizeof(g)) != 0)
+        fprintf(stderr, "mlock: %s\n", strerror(errno));
     atomic_store(&g.running, true);
     pthread_t net;
     pthread_create(&net, NULL, net_thread, NULL);
+    struct sched_param sp = { .sched_priority = 70 };
+    int rt = pthread_setschedparam(net, SCHED_FIFO, &sp);
+    if (rt != 0)
+        fprintf(stderr, "network thread stays normal priority: %s\n", strerror(rt));
     if (aec_on)
         set_aec(true);
     pw_main_loop_run(g.loop);
