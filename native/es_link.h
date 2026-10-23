@@ -1,4 +1,5 @@
-// Network link: one ROC sender streaming mono float32 PCM to an Earshot receiver.
+// Network link: a ROC encoder streaming mono float32 PCM to an Earshot receiver, over
+// one UDP socket marked as voice traffic.
 #pragma once
 
 #include <stddef.h>
