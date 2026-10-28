@@ -19,6 +19,8 @@
 
 #include <pipewire/pipewire.h>
 #include <spa/param/audio/format-utils.h>
+#include <spa/param/props.h>
+#include <spa/pod/iter.h>
 #include <roc/config.h>
 #include <roc/context.h>
 #include <roc/log.h>
@@ -70,13 +72,15 @@
 #define ACQ_LEN (1 << 17)            // 2.7 s per delay measurement
 #define MAX_LAG 12000                // search up to 250 ms
 #define RECHECK_S 5
+#define ALIGN_MIN_ECHO 1e-7f         // mean square of the expected echo worth aligning on (-70 dBFS)
+#define TYPICAL_LAG 2000             // speaker sound reaches the phone's mic ~40 ms after playing
 #define DUMP_MAX_S 180               // the dump's length (16 bytes a sample: 138 MB)
 #define DUMP_BACK 1024              // the dump's speaker column lags its mic column by this
 #define ZERO_RUN 32                  // this many exact zeros in a row: the mic is off or muted
 #define GAP_MIN 16                   // a hole of exact zeros this long or longer, but shorter
 #define GAP_MAX (RATE / 10)          // than this, is the decoder concealing a missing packet
 
-enum { AEC_OFF, AEC_ACQUIRE, AEC_RUN };
+enum { AEC_OFF, AEC_ACQUIRE, AEC_RUN }; // ACQUIRE: no longer used (a filter that waited for a measurement)
 
 // One decoder per stream from the phone (a new SSRC means the phone restarted its sender).
 struct epoch {
@@ -154,11 +158,35 @@ static struct {
     struct pw_core* core;
     struct spa_hook stream_listener, ref_listener, core_listener;
     struct pw_stream* ref_stream;
+    // The speaker capture is the mix before the output's volume (a hardware mixer, or the monitor
+    // taken ahead of it): scale it by that volume, or every volume change would look to the echo
+    // canceller like a new echo path, louder or quieter than it learned.
+    _Atomic float ref_gain;
+    struct pw_registry* registry;
+    struct spa_hook registry_listener, sink_listener;
+    struct pw_proxy* sink;          // the output the speaker capture is linked to
+    uint32_t sink_id;
+    struct { uint32_t id, out, in; } links[256]; // the graph's links, to find that output
+    float sink_vol, sink_chan;      // its volume and mean channel volume
+    bool sink_mute;
     bool streaming;                 // someone is listening to the mic
-    atomic_int aec_want;            // AEC_OFF or AEC_ACQUIRE (set by the main thread)
+    atomic_int aec_want;            // AEC_OFF or AEC_RUN (set by the main thread)
     int aec_state;                  // RT copy
     atomic_int aec_delay;           // filter's first lag, set by the main thread
     atomic_bool aec_new_delay;
+    atomic_bool aec_unsure;         // the delay may have moved: measure as soon as possible
+    bool aec_refill;                // RT: rebuild the filter's speaker history at the next block
+    bool aligning;                  // RT: finding how far the echo moved before subtracting again
+    int align_n, align_wait;        // samples in the window; of speaker sound waited through
+    float align_e;                  // speaker power over the alignment window
+    float align_mic[AEC_ALIGN], align_pred[AEC_ALIGN];
+    atomic_bool snap_req, snap_ready; // the echo path, copied out at a block boundary to be saved
+    int snap_d;
+    float snap[AEC_PATH_FLOATS];
+    float refill_buf[AEC_P * AEC_N];
+    int saved_lag;                  // bulk delay: the last measured, from this run or the last
+    bool lag_measured;              // this run measured it: worth saving
+    double saved_ppm;               // the clock ratio as loaded
     int aec_d;
     aec* aec;
     float ref_ring[RING], mic_ring[RING];
@@ -173,6 +201,7 @@ static struct {
     bool offset_known;
     int64_t blk_start;              // tick of the block in progress (-1: none)
     float pred[AEC_N], err[AEC_N];
+    float share;                    // of pred to subtract (aec_share)
     bool blk_learn;
     int zero_run;
 
@@ -185,9 +214,10 @@ static struct {
     _Atomic double st_err, st_corr, st_integ;
     atomic_bool st_fitted;          // this run measured the clock ratio itself: worth saving
     atomic_int st_state;            // 0 idle, 1 settling, 2 locked
-    atomic_uint st_skips, st_windows, st_late, st_slow, st_gaps;
+    atomic_uint st_skips, st_windows, st_late, st_slow, st_gaps, st_aec_resets;
     atomic_uint st_gap_len, st_pop_fail; // the latest gap's length in samples; decoder pops that failed
     _Atomic double st_erle;         // mic over output power, last second, dB
+    atomic_int st_align;            // the last alignment's shift (99999: no match)
     atomic_int st_aec;              // the RT thread's aec_state
     int64_t last_cycle;
     _Atomic int64_t st_max_ns;
@@ -556,8 +586,67 @@ apply:;
     g.step = 1.0 + g.corr;
 }
 
+static int min_start(void);
+
+// Move the filter `s` samples later along with the echo (it keeps what it learned, which is
+// relative to its start), within where it may start.
+static void aec_move(int s) {
+    int d = g.aec_d + s;
+    if (d < min_start()) { // can't start that close: give up the blocks it can't keep
+        int k = (min_start() - d + AEC_N - 1) / AEC_N;
+        aec_shift(g.aec, k);
+        d += k * AEC_N;
+    }
+    g.aec_d = d;
+    atomic_store(&g.aec_delay, d);
+    atomic_store(&g.aec_new_delay, false);
+    g.aec_refill = true;
+    g.blk_start = -1;
+}
+
+// After a new mic session the echo arrives a little earlier or later than before (the phone's
+// capture latency differs each time), and a filter off by even a millisecond is wrong at the top
+// of the band. Rather than relearn for seconds, with the loop through the speakers open: compare
+// ~85 ms of the mic with what the filter expects, and move it by the difference.
+static void align_start(void) {
+    aec_recall(g.aec);
+    g.aligning = aec_knows_path(g.aec);
+    g.align_n = 0;
+    g.align_wait = 0;
+    g.align_e = 0;
+}
+
+static void align_done(void) {
+    g.align_n = 0;
+    float pp = 0;
+    int zeros = 0;
+    for (int i = 0; i < AEC_ALIGN; i++) {
+        pp += g.align_pred[i] * g.align_pred[i];
+        zeros += g.align_mic[i] == 0.0f;
+    }
+    if (zeros > AEC_ALIGN / 16) {
+        g.align_e = 0;
+        return; // the phone's mic was still starting (it sends exact zeros): nothing to match against
+    }
+    bool playing = g.align_e > AEC_ALIGN * 1e-6f;
+    g.align_e = 0;
+    // Too little echo to match (the speakers quiet, or just starting) is also too little to howl:
+    // wait for a window with some, but not past 2 s of sound.
+    if (pp < AEC_ALIGN * ALIGN_MIN_ECHO && (!playing || (g.align_wait += AEC_ALIGN) < 2 * RATE))
+        return;
+    g.aligning = false;
+    int s = aec_align(g.aec, g.align_pred, g.align_mic);
+    if (s != AEC_NO_SHIFT)
+        aec_move(s);
+    else
+        g.blk_start = -1; // nothing matched (the phone moved?): the filter adapts from where it is
+    atomic_store(&g.st_align, s == AEC_NO_SHIFT ? 99999 : s);
+}
+
 // One mic sample at graph tick t: subtract the predicted echo, block by block.
 static inline float cancel(int64_t t, float mic) {
+    if (!isfinite(mic))
+        mic = 0.0f;
     g.mic_ring[t & (RING - 1)] = mic;
     if (g.aec_state != AEC_RUN)
         return mic;
@@ -571,15 +660,29 @@ static inline float cancel(int64_t t, float mic) {
                 r[i] = g.ref_ring[(from + i) & (RING - 1)];
                 e += r[i] * r[i];
             }
+            if (g.aec_refill) {
+                for (int i = 0; i < AEC_P * AEC_N; i++)
+                    g.refill_buf[i] = g.ref_ring[(from - AEC_P * AEC_N + i) & (RING - 1)];
+                aec_refill(g.aec, g.refill_buf);
+                g.aec_refill = false;
+            }
             aec_predict(g.aec, r, g.pred);
+            g.share = aec_share(g.aec);
+            g.align_e += e;
             g.blk_start = t;
             g.blk_learn = e > AEC_N * 1e-7f; // nothing to learn while the speakers are silent
         }
     }
     if (g.blk_start < 0)
         return mic; // no prediction for this block: it started mid-block, or no reference yet
-    float out = mic - g.pred[ph];
-    g.err[ph] = out;
+    g.err[ph] = mic - g.pred[ph];
+    float out = mic - g.share * g.pred[ph];
+    if (!isfinite(g.err[ph])) { // the filter blew up: start over rather than send NaN to every app
+        aec_reset(g.aec);
+        g.blk_start = -1;
+        atomic_fetch_add(&g.st_aec_resets, 1);
+        return mic;
+    }
     if (mic == 0.0f) {
         if (++g.zero_run >= ZERO_RUN) { // the phone sends silence (muted, or its mic taken)
             g.blk_learn = false;
@@ -588,8 +691,31 @@ static inline float cancel(int64_t t, float mic) {
     } else {
         g.zero_run = 0;
     }
+    if (g.aligning) {
+        // The filter holds still while it is matched against the mic (learning would blur the
+        // match), and subtracts only the share that matches: none while it is off, so a stale
+        // filter can't feed the loop through the speakers, and the mic is never left raw while it is
+        // right (with the loop over unity, ~85 ms raw is a few trips round it).
+        g.align_mic[g.align_n] = mic;
+        g.align_pred[g.align_n] = g.pred[ph];
+        if (ph == AEC_N - 1) {
+            if (aec_update(g.aec, g.err, false))
+                atomic_fetch_add(&g.st_aec_resets, 1);
+            g.blk_start = -1;
+        }
+        if (++g.align_n == AEC_ALIGN)
+            align_done();
+        return out;
+    }
     if (ph == AEC_N - 1) {
-        aec_update(g.aec, g.err, g.blk_learn);
+        if (aec_update(g.aec, g.err, g.blk_learn))
+            atomic_fetch_add(&g.st_aec_resets, 1);
+        if (atomic_load_explicit(&g.snap_req, memory_order_relaxed)) {
+            aec_get_path(g.aec, g.snap);
+            g.snap_d = g.aec_d;
+            atomic_store_explicit(&g.snap_req, false, memory_order_relaxed);
+            atomic_store_explicit(&g.snap_ready, true, memory_order_release);
+        }
         g.blk_start = -1;
     }
     return out;
@@ -600,6 +726,31 @@ static inline float cancel(int64_t t, float mic) {
 static void acq_restart(int64_t T) {
     atomic_store(&g.acq_from, T);
     atomic_store(&g.aec_new_delay, false);
+}
+
+// The speaker history the filter holds no longer lines up with the mic: keep subtracting with
+// what it learned, and have the delay checked again.
+// `history`: the speaker history is still good, only the mic moved against it.
+static void aec_discontinuity(bool history) {
+    if (g.aec_state == AEC_RUN) {
+        aec_forget(g.aec);
+        if (history)
+            align_start(); // a new stream: the echo may have moved
+    }
+    g.aec_refill = history;
+    g.blk_start = -1;
+    atomic_store(&g.aec_unsure, true);
+}
+
+// The mic jumped `skip` samples ahead in the phone's stream: the echo now arrives that much
+// sooner, exactly. Move the filter with it and it stays right, with nothing to relearn.
+static void aec_skipped(uint32_t skip) {
+    if (g.aec_state != AEC_RUN) {
+        aec_discontinuity(true);
+        return;
+    }
+    aec_move(-(int)skip);
+    atomic_store(&g.aec_unsure, true);
 }
 
 static void on_process(void* data) {
@@ -632,8 +783,7 @@ static void on_process(void* data) {
             g.offset_known = true;
             atomic_store(&g.ref_end, 0);  // what was written under the old mapping is unusable
             acq_restart(T);
-            if (g.aec_state == AEC_RUN)
-                g.aec_state = AEC_ACQUIRE;
+            aec_discontinuity(false); // the speaker history was written under the old mapping
         }
     }
 
@@ -645,8 +795,7 @@ static void on_process(void* data) {
         reset_loop_state();
         if (timed)
             acq_restart(T); // the old stream's mic, at its old delay, can't be measured against
-        if (g.aec_state == AEC_RUN)
-            g.aec_state = AEC_ACQUIRE; // a new stream settles at a new delay
+        aec_discontinuity(true); // a new stream may settle at a new delay
     }
     if (g.to_retire) {
         struct epoch* none = NULL;
@@ -655,16 +804,31 @@ static void on_process(void* data) {
     }
 
     // Echo cancellation state, as the main thread asks.
+    // It subtracts from the first sample on: at the last known delay, with what it has learned,
+    // until a measurement says the direct sound moved outside the filter. Waiting for one would
+    // leave the loop through the speakers uncancelled for seconds, which is enough to howl.
     if (atomic_load(&g.aec_want) == AEC_OFF || !timed) {
         g.aec_state = AEC_OFF;
     } else {
-        if (g.aec_state == AEC_OFF)
-            g.aec_state = AEC_ACQUIRE;
-        if (atomic_exchange(&g.aec_new_delay, false)) {
+        if (g.aec_state == AEC_OFF) {
             g.aec_d = atomic_load(&g.aec_delay);
-            aec_reset(g.aec);
+            aec_forget(g.aec);
+            g.aec_refill = true;
+            align_start(); // a new mic session: the echo may have moved
             g.aec_state = AEC_RUN;
             g.blk_start = -1;
+        }
+        if (atomic_exchange(&g.aec_new_delay, false)) {
+            int d = atomic_load(&g.aec_delay);
+            if ((d - g.aec_d) % AEC_N == 0) { // the main thread moves it in whole blocks
+                aec_shift(g.aec, (d - g.aec_d) / AEC_N);
+                g.aec_d = d;
+                g.aec_refill = true;
+                g.blk_start = -1;
+            } else { // measured before a cut moved it: measure again
+                atomic_store(&g.aec_delay, g.aec_d);
+                atomic_store(&g.aec_unsure, true);
+            }
         }
     }
     if (timed && T != atomic_load_explicit(&g.mic_end, memory_order_relaxed)) {
@@ -681,8 +845,7 @@ static void on_process(void* data) {
             g.pos += g.skip;
             if (timed)
                 acq_restart(T);
-            if (g.aec_state == AEC_RUN)
-                g.aec_state = AEC_ACQUIRE;
+            aec_skipped(g.skip);
         }
         int64_t keep = (int64_t)floor(pos0 < g.pos ? pos0 : g.pos) - RS_HALF;
         rs_need((int64_t)floor(g.pos + (n - 1) * g.step) + RS_HALF + 1, keep);
@@ -780,8 +943,9 @@ static void on_ref_process(void* data) {
         const float* src = d->data ? (const float*)((uint8_t*)d->data + d->chunk->offset) : NULL;
         for (int64_t t = end; t < T && T - t < RING; t++)
             g.ref_ring[t & (RING - 1)] = 0; // a gap: nothing was played
+        float gain = atomic_load_explicit(&g.ref_gain, memory_order_relaxed);
         for (uint32_t i = 0; i < n; i++)
-            g.ref_ring[(T + i) & (RING - 1)] = src ? src[i] : 0;
+            g.ref_ring[(T + i) & (RING - 1)] = src && isfinite(src[i]) ? gain * src[i] : 0; // an app can play NaN; one would poison the filter for good
         atomic_store_explicit(&g.ref_end, T + n, memory_order_release);
     }
     pw_stream_queue_buffer(g.ref_stream, b);
@@ -810,8 +974,19 @@ static const struct pw_stream_events stream_events = {
     .process = on_process,
 };
 
+static void sink_find(void);
+
+static void on_ref_state(void* data, enum pw_stream_state old, enum pw_stream_state state, const char* error) {
+    (void)data;
+    (void)old;
+    (void)state;
+    (void)error;
+    sink_find(); // its node id is known from here on
+}
+
 static const struct pw_stream_events ref_events = {
     PW_VERSION_STREAM_EVENTS,
+    .state_changed = on_ref_state,
     .process = on_ref_process,
 };
 
@@ -820,6 +995,118 @@ static const struct spa_pod* mono_format(struct spa_pod_builder* pb) {
     info.position[0] = SPA_AUDIO_CHANNEL_MONO;
     return spa_format_audio_raw_build(pb, SPA_PARAM_EnumFormat, &info);
 }
+
+static void sink_gain_update(void) {
+    atomic_store_explicit(&g.ref_gain, g.sink_mute ? 0.0f : g.sink_vol * g.sink_chan, memory_order_relaxed);
+}
+
+static void on_sink_param(void* data, int seq, uint32_t id, uint32_t index, uint32_t next, const struct spa_pod* param) {
+    (void)data;
+    (void)seq;
+    (void)index;
+    (void)next;
+    if (id != SPA_PARAM_Props || !param || !spa_pod_is_object(param))
+        return;
+    const struct spa_pod_prop* prop;
+    SPA_POD_OBJECT_FOREACH((const struct spa_pod_object*)param, prop) {
+        float vols[SPA_AUDIO_MAX_CHANNELS];
+        uint32_t nv;
+        bool mute;
+        switch (prop->key) {
+        case SPA_PROP_volume:
+            spa_pod_get_float(&prop->value, &g.sink_vol);
+            break;
+        case SPA_PROP_mute:
+            if (spa_pod_get_bool(&prop->value, &mute) == 0)
+                g.sink_mute = mute;
+            break;
+        case SPA_PROP_channelVolumes:
+            nv = spa_pod_copy_array(&prop->value, SPA_TYPE_Float, vols, SPA_AUDIO_MAX_CHANNELS);
+            if (nv > 0) {
+                float sum = 0;
+                for (uint32_t i = 0; i < nv; i++)
+                    sum += vols[i];
+                g.sink_chan = sum / nv; // the capture is the channels' mix
+            }
+            break;
+        }
+    }
+    sink_gain_update();
+}
+
+static const struct pw_node_events sink_events = {
+    PW_VERSION_NODE_EVENTS,
+    .param = on_sink_param,
+};
+
+static void sink_drop(void) {
+    if (g.sink) {
+        spa_hook_remove(&g.sink_listener);
+        pw_proxy_destroy(g.sink);
+        g.sink = NULL;
+    }
+    g.sink_id = SPA_ID_INVALID;
+    g.sink_vol = g.sink_chan = 1;
+    g.sink_mute = false;
+    sink_gain_update();
+}
+
+// Follow the volume of whatever output the speaker capture is linked to now.
+static void sink_find(void) {
+    uint32_t me = g.ref_stream ? pw_stream_get_node_id(g.ref_stream) : SPA_ID_INVALID;
+    uint32_t out = SPA_ID_INVALID;
+    for (size_t i = 0; i < SPA_N_ELEMENTS(g.links) && me != SPA_ID_INVALID; i++)
+        if (g.links[i].id && g.links[i].in == me)
+            out = g.links[i].out;
+    if (out == g.sink_id)
+        return;
+    sink_drop();
+    if (out == SPA_ID_INVALID)
+        return;
+    g.sink = pw_registry_bind(g.registry, out, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, 0);
+    if (!g.sink)
+        return;
+    g.sink_id = out;
+    pw_node_add_listener((struct pw_node*)g.sink, &g.sink_listener, &sink_events, NULL);
+    uint32_t ids[] = { SPA_PARAM_Props };
+    pw_node_subscribe_params((struct pw_node*)g.sink, ids, 1);
+}
+
+static void on_global(void* data, uint32_t id, uint32_t perms, const char* type, uint32_t version, const struct spa_dict* props) {
+    (void)data;
+    (void)perms;
+    (void)version;
+    if (strcmp(type, PW_TYPE_INTERFACE_Link) != 0 || !props)
+        return;
+    const char* o = spa_dict_lookup(props, PW_KEY_LINK_OUTPUT_NODE);
+    const char* in = spa_dict_lookup(props, PW_KEY_LINK_INPUT_NODE);
+    if (!o || !in)
+        return;
+    for (size_t i = 0; i < SPA_N_ELEMENTS(g.links); i++)
+        if (!g.links[i].id) {
+            g.links[i].id = id;
+            g.links[i].out = (uint32_t)atoi(o);
+            g.links[i].in = (uint32_t)atoi(in);
+            break;
+        }
+    sink_find();
+}
+
+static void on_global_remove(void* data, uint32_t id) {
+    (void)data;
+    for (size_t i = 0; i < SPA_N_ELEMENTS(g.links); i++)
+        if (g.links[i].id == id)
+            g.links[i].id = 0;
+    if (id == g.sink_id)
+        sink_drop();
+    sink_find();
+}
+
+static const struct pw_registry_events registry_events = {
+    PW_VERSION_REGISTRY_EVENTS,
+    .global = on_global,
+    .global_remove = on_global_remove,
+};
 
 static void ref_connect(void) {
     if (g.ref_stream)
@@ -844,7 +1131,7 @@ static void ref_connect(void) {
 }
 
 static void set_aec(bool on) {
-    atomic_store(&g.aec_want, on ? AEC_ACQUIRE : AEC_OFF);
+    atomic_store(&g.aec_want, on ? AEC_RUN : AEC_OFF);
     if (on)
         ref_connect();
     ref_update_active();
@@ -887,35 +1174,45 @@ static int min_start(void) {
 
 static int filter_start(int lag) { return lag - AEC_MARGIN > min_start() ? lag - AEC_MARGIN : min_start(); }
 
+// Where to move the filter so the direct sound at `lag` sits AEC_MARGIN in: in whole blocks, so
+// what it has learned stays valid where it is.
+static int pan_to(int d, int lag) {
+    int k = (int)lround((double)(filter_start(lag) - d) / AEC_N);
+    while (d + k * AEC_N < min_start())
+        k++;
+    return d + k * AEC_N;
+}
+
 static void aec_tick(void) {
-    if (atomic_load(&g.aec_want) == AEC_OFF || !g.streaming)
+    if (atomic_load(&g.aec_want) == AEC_OFF || !g.streaming || atomic_load(&g.st_aec) != AEC_RUN)
         return;
-    int state = atomic_load(&g.st_aec);
-    if (state == AEC_ACQUIRE) {
-        int lag = measure_delay();
-        if (lag >= 0) {
-            atomic_store(&g.aec_delay, filter_start(lag));
-            atomic_store(&g.aec_new_delay, true);
+    bool unsure = atomic_load(&g.aec_unsure);
+    if (!unsure && --g.recheck_in > 0)
+        return;
+    // The delay holds still, but a new stream, a cut or a pull of the queue can move it: follow.
+    // Moving the filter is cheap (it keeps what it learned), but every move drops the end it
+    // leaves, so only move when the direct sound nears its start, leaves it less than 100 ms of
+    // tail, or the graph cycle outgrew the start.
+    int d = atomic_load(&g.aec_delay), lag = measure_delay();
+    if (lag < 0) {
+        if (!unsure)
             g.recheck_in = RECHECK_S;
+        return; // nothing to measure yet (silence, or not enough history since the stream changed)
+    }
+    atomic_store(&g.aec_unsure, false);
+    g.recheck_in = RECHECK_S;
+    g.saved_lag = lag;
+    g.lag_measured = true;
+    int off = lag - d, to = pan_to(d, lag);
+    bool out = off < 240 || off > AEC_TAPS_MS * 48 - 4800 || d < min_start();
+    if (to != d && out) {
+        if (unsure || ++g.recheck_miss >= (off < 240 ? 1 : 2)) { // the direct sound outside the filter: now
+            atomic_store(&g.aec_delay, to);
+            atomic_store(&g.aec_new_delay, true);
             g.recheck_miss = 0;
         }
-    } else if (state == AEC_RUN && --g.recheck_in <= 0) {
-        // The delay holds still, but a cut or a pull of the queue can move it: follow.
-        g.recheck_in = RECHECK_S;
-        // The filter covers the drift of a few samples a minute and any small shift by itself;
-        // restarting it costs seconds of echo, so only do that when the direct sound nears its
-        // start, leaves it less than 100 ms of tail, or the graph cycle outgrew the start.
-        int d = atomic_load(&g.aec_delay), lag = measure_delay(), off = lag - d;
-        bool out = off < 240 || off > AEC_TAPS_MS * 48 - 4800 || d < min_start();
-        if (lag >= 0 && filter_start(lag) != d && out) {
-            if (++g.recheck_miss >= (off < 240 ? 1 : 2)) { // the direct sound outside the filter: now
-                atomic_store(&g.aec_delay, filter_start(lag));
-                atomic_store(&g.aec_new_delay, true);
-                g.recheck_miss = 0;
-            }
-        } else if (lag >= 0) {
-            g.recheck_miss = 0;
-        }
+    } else {
+        g.recheck_miss = 0;
     }
 }
 
@@ -964,9 +1261,14 @@ static const struct pw_core_events core_events = {
 static void load_clock(void) {
     FILE* f = g.clock_path ? fopen(g.clock_path, "r") : NULL;
     double ppm;
+    int lag;
+    g.saved_lag = TYPICAL_LAG;
     if (f && fscanf(f, "%lf", &ppm) == 1 && fabs(ppm) < CORR_MAX * 1e6) {
         g.integ = ppm * 1e-6;
         g.have_integ = true;
+        g.saved_ppm = ppm;
+        if (fscanf(f, "%d", &lag) == 1 && lag > 0 && lag < MAX_LAG)
+            g.saved_lag = lag;
     }
     if (f)
         fclose(f);
@@ -975,16 +1277,61 @@ static void load_clock(void) {
 }
 
 static void save_clock(void) {
-    if (!g.clock_path || !atomic_load(&g.st_fitted))
-        return; // a run that never measured the clock (no stream, or too short) keeps the saved one
+    bool fitted = atomic_load(&g.st_fitted);
+    if (!g.clock_path || (!fitted && !g.lag_measured))
+        return; // a run that measured neither (no stream, or too short) keeps what was saved
     char tmp[4096];
     snprintf(tmp, sizeof(tmp), "%s.tmp", g.clock_path);
     FILE* f = fopen(tmp, "w");
     if (!f)
         return;
-    fprintf(f, "%.4f\n", atomic_load(&g.st_integ) * 1e6);
+    fprintf(f, "%.4f\n%d\n", fitted ? atomic_load(&g.st_integ) * 1e6 : g.saved_ppm, g.saved_lag);
     if (fclose(f) == 0)
         rename(tmp, g.clock_path);
+}
+
+// The learned echo path, kept next to the clock file: a restart then cancels from the first
+// moment, after a ~85 ms alignment, instead of relearning the room.
+#define ECHO_MAGIC 0x45534532u // "ESE2": learned from the speakers after their volume (ESE1: before)
+static void echo_path_name(char* buf, size_t n) { snprintf(buf, n, "%s.echo", g.clock_path); }
+
+static void load_echo_path(void) {
+    if (!g.clock_path)
+        return;
+    char name[4096];
+    echo_path_name(name, sizeof(name));
+    FILE* f = fopen(name, "rb");
+    if (!f)
+        return;
+    uint32_t hdr[3];
+    if (fread(hdr, sizeof(hdr), 1, f) == 1 && hdr[0] == ECHO_MAGIC && hdr[1] == AEC_PATH_FLOATS
+        && hdr[2] > 0 && hdr[2] < MAX_LAG && fread(g.snap, sizeof(g.snap), 1, f) == 1) {
+        bool ok = true;
+        for (int i = 0; i < AEC_PATH_FLOATS && ok; i++)
+            ok = isfinite(g.snap[i]);
+        if (ok) {
+            aec_set_path(g.aec, g.snap);
+            atomic_store(&g.aec_delay, (int)hdr[2]);
+        }
+    }
+    fclose(f);
+}
+
+static void save_echo_path(void) {
+    if (!g.clock_path || !atomic_exchange_explicit(&g.snap_ready, false, memory_order_acquire))
+        return;
+    char name[4096], tmp[4200];
+    echo_path_name(name, sizeof(name));
+    snprintf(tmp, sizeof(tmp), "%s.tmp", name);
+    FILE* f = fopen(tmp, "wb");
+    if (!f)
+        return;
+    uint32_t hdr[3] = { ECHO_MAGIC, AEC_PATH_FLOATS, (uint32_t)g.snap_d };
+    bool ok = fwrite(hdr, sizeof(hdr), 1, f) == 1 && fwrite(g.snap, sizeof(g.snap), 1, f) == 1;
+    if (fclose(f) == 0 && ok)
+        rename(tmp, name);
+    else
+        unlink(tmp);
 }
 
 static void on_tick(void* data, uint64_t expirations) {
@@ -995,20 +1342,26 @@ static void on_tick(void* data, uint64_t expirations) {
         FILE* f = fopen(g.stats_path, ticks % 3600 == 0 ? "w" : "a"); // keeps the last hour or so
         if (f) {
             fprintf(f, "%.3f state=%d err=%.1f corr_ppm=%.3f ratio_ppm=%.3f skips=%u gaps=%u late=%u slow=%u max_us=%.0f"
-                    " aec=%d delay=%d reduction_db=%.1f mic_ahead=%lld gap_len=%u pop_fail=%u\n",
+                    " aec=%d delay=%d reduction_db=%.1f mic_ahead=%lld gap_len=%u pop_fail=%u aec_resets=%u align=%d ref_gain=%.3f\n",
                     (double)now_ns() / 1e9, atomic_load(&g.st_state), atomic_load(&g.st_err),
                     atomic_load(&g.st_corr) * 1e6, atomic_load(&g.st_integ) * 1e6,
                     atomic_load(&g.st_skips), atomic_load(&g.st_gaps),
                     atomic_load(&g.st_late), atomic_load(&g.st_slow), (double)atomic_load(&g.st_max_ns) / 1e3,
                     atomic_load(&g.st_aec), atomic_load(&g.aec_lag), atomic_load(&g.st_erle),
                     (long long)(atomic_load(&g.mic_end) - atomic_load(&g.ref_end)), atomic_load(&g.st_gap_len),
-                    atomic_load(&g.st_pop_fail));
+                    atomic_load(&g.st_pop_fail), atomic_load(&g.st_aec_resets),
+                    atomic_load(&g.st_align), (double)atomic_load(&g.ref_gain));
             fclose(f);
         }
     }
     aec_tick();
-    if (++ticks % 60 == 0)
+    save_echo_path(); // the copy asked for last time, if the RT thread made it
+    if (++ticks % 60 == 0) {
         save_clock();
+        // Only a path that works is worth keeping: it must be taking the echo well down.
+        if (atomic_load(&g.st_aec) == AEC_RUN && atomic_load(&g.st_erle) > 10 && atomic_load(&g.st_align) != 99999)
+            atomic_store(&g.snap_req, true);
+    }
 }
 
 static void on_signal(void* data, int sig) {
@@ -1044,6 +1397,8 @@ int main(int argc, char** argv) {
     if (g.latency_ms < 5 || g.latency_ms > 1000)
         return fprintf(stderr, "latency out of range\n"), 2;
     load_clock();
+    atomic_store(&g.aec_delay, filter_start(g.saved_lag)); // until a measurement says otherwise
+    atomic_store(&g.aec_unsure, true);
     const char* dump = getenv("EARSHOT_RX_DUMP");
     g.dump_fd = dump ? open(dump, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644) : -1;
     g.dump_left = (int64_t)DUMP_MAX_S * RATE;
@@ -1055,6 +1410,7 @@ int main(int argc, char** argv) {
     g.blk_start = -1;
     if (!g.aec)
         return 1;
+    load_echo_path();
 
     roc_log_set_level(ROC_LOG_ERROR);
     roc_log_set_handler(on_roc_log, NULL);
@@ -1089,6 +1445,12 @@ int main(int argc, char** argv) {
     if (!g.core)
         return fprintf(stderr, "can't connect to PipeWire\n"), 1;
     pw_core_add_listener(g.core, &g.core_listener, &core_events, NULL);
+    g.sink_id = SPA_ID_INVALID;
+    g.sink_vol = g.sink_chan = 1;
+    sink_gain_update();
+    g.registry = pw_core_get_registry(g.core, PW_VERSION_REGISTRY, 0);
+    if (g.registry)
+        pw_registry_add_listener(g.registry, &g.registry_listener, &registry_events, NULL);
 
     struct pw_properties* props = pw_properties_new(
         PW_KEY_NODE_NAME, g.node, PW_KEY_NODE_DESCRIPTION, g.description,
@@ -1126,6 +1488,10 @@ int main(int argc, char** argv) {
     pw_main_loop_run(g.loop);
 
     save_clock();
+    if (g.sink)
+        pw_proxy_destroy(g.sink);
+    if (g.registry)
+        pw_proxy_destroy((struct pw_proxy*)g.registry);
     if (g.ref_stream)
         pw_stream_destroy(g.ref_stream);
     pw_stream_destroy(g.stream);

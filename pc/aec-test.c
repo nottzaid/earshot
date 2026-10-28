@@ -42,14 +42,14 @@ int main(int argc, char** argv) {
         for (int i = 0; i < AEC_N; i++)
             r[i] = b + i - D >= 0 ? ref[b + i - D] : 0;
         aec_predict(a, r, pred);
-        float e = 0;
+        float share = aec_share(a), e = 0;
         for (int i = 0; i < AEC_N; i++) {
             err[i] = mic[b + i] - pred[i];
             e += r[i] * r[i];
         }
         aec_update(a, err, e > AEC_N * 1e-7f);
         for (int i = 0; i < AEC_N; i++) {
-            float pair[2] = { mic[b + i], err[i] };
+            float pair[2] = { mic[b + i], mic[b + i] - share * pred[i] };
             fwrite(pair, sizeof(float), 2, o);
         }
     }
