@@ -32,7 +32,14 @@ static void log_to_logcat(const roc_log_message* msg, void* arg) {
 #define ES_TOS 0xb8
 #define MAX_PACKET 2048
 
-// Bench overrides, read when a stream opens: "tos=136 shed_repair=8000 shed_all=20000 probe=1".
+// When the radio stalls, packets pile up below the socket; a healthy link holds at most ~10 KB.
+// Past these, what we'd add arrives too late for the receiver's 30 ms buffer and only delays the
+// fresh audio behind it: drop repair first, then audio. Control is never dropped.
+#define ES_SHED_REPAIR 20480
+#define ES_SHED_ALL 32768
+
+// Bench overrides, read when a stream opens: "tos=136 shed_repair=8000 shed_all=20000 probe=1"
+// (shed_*=0 turns shedding off).
 #define ES_TUNE_FILE "/sdcard/Android/data/dev.nottzaid.earshot/files/link.conf"
 
 struct es_link {
@@ -69,6 +76,8 @@ es_link* es_link_open(const es_link_params* p) {
         return NULL;
     link->fd = -1;
     link->tos = ES_TOS;
+    link->shed_repair = ES_SHED_REPAIR;
+    link->shed_all = ES_SHED_ALL;
     read_tuning(link);
 
     roc_log_set_level(ROC_LOG_ERROR);
@@ -149,7 +158,7 @@ int es_link_write(es_link* link, const float* samples, size_t count) {
     if (roc_sender_encoder_push_frame(link->encoder, &frame) != 0)
         return -1;
 
-    // Lost sends are the network's business, as they were with Roc's own sockets.
+    // Lost sends are the network's business, as they were with Roc's own sockets; a backlog is ours.
     for (int i = 0; i < 3; i++) {
         for (;;) {
             roc_packet pkt = { buf, sizeof(buf) };
