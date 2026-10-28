@@ -194,7 +194,7 @@ suspend fun runControlSession(
                     val line = try {
                         reader.readLine()
                     } catch (_: SocketTimeoutException) {
-                        if (System.nanoTime() - lastHeard > 7_000_000_000) break // PC went quiet
+                        if (System.nanoTime() - lastHeard > 20_000_000_000) break // PC went quiet (a stalled link gets 20 s)
                         continue
                     } ?: break
                     lastHeard = System.nanoTime()

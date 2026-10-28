@@ -49,6 +49,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -165,10 +166,11 @@ class MicService : LifecycleService() {
         }
 
         // Smart standby: an app on the PC opening the mic opens ours; closing it closes ours a little later,
-        // so an app that briefly reopens its input doesn't bounce the phone's mic.
+        // so an app that briefly reopens its input doesn't bounce the phone's mic. Only the PC can say nobody
+        // listens: losing the control link (a Wi-Fi stall) keeps the last answer, and LINK_LOST_MS decides.
         lifecycleScope.launch {
             var releaseJob: Job? = null
-            Earshot.runtime.map { it.connected && it.pcState.listening }.distinctUntilChanged().collect { listening ->
+            Earshot.runtime.filter { it.connected }.map { it.pcState.listening }.distinctUntilChanged().collect { listening ->
                 releaseJob?.cancel()
                 if (listening) pcListening.value = true
                 else releaseJob = launch {
@@ -489,7 +491,7 @@ class MicService : LifecycleService() {
         private const val CHANNEL = "mic"
         private const val NOTIFICATION_ID = 1
         private const val STANDBY_GRACE_MS = 3000L
-        private const val LINK_LOST_MS = 8000L
+        private const val LINK_LOST_MS = 30_000L // a stalling Wi-Fi (Battery Saver, screen off) recovers within this
         private const val WAKE_LOCK_MS = 2 * 60 * 60 * 1000L
         const val ACTION_START = "dev.nottzaid.earshot.START"
         const val ACTION_STOP = "dev.nottzaid.earshot.STOP"
