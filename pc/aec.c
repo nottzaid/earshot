@@ -37,6 +37,7 @@ struct aec {
     int guard_n;                   // blocks those have seen since the last reset
     float mp, pp;                  // smoothed mic x prediction and prediction power
     float share;                   // of the prediction to subtract: least squares over mp, pp
+    int partial;                   // blocks until the speaker history is whole again
     float complex G[P][K];         // the last echo path that cancelled well, as W
     bool have_good;
     int good_n;                    // blocks cancelling well since G was last kept
@@ -93,6 +94,7 @@ void aec_reset(aec* a) {
     a->mic_pow = a->out_pow = 0;
     a->guard_n = 0;
     a->mp = a->pp = a->share = 0;
+    a->partial = P;
     a->have_good = false;
     a->good_n = 0;
 }
@@ -101,6 +103,7 @@ void aec_forget(aec* a) {
     memset(a->prev, 0, sizeof(a->prev));
     memset(a->X, 0, sizeof(a->X));
     a->mp = a->pp = a->share = 0; // how well it predicted says nothing about the new stream
+    a->partial = P;
     // It stays as sure of the path as it was: made unsure, it lurches away from a right one for
     // the first second of every stream. A path that did move trips the guard, which unsettles it.
 }
@@ -132,7 +135,13 @@ void aec_shift(aec* a, int k) {
 
 void aec_refill(aec* a, const float* hist) {
     memset(a->prev, 0, sizeof(a->prev));
+    a->partial = 0;
     for (int p = 0; p < P; p++) {
+        bool silent = true;
+        for (int i = 0; i < N && silent; i++)
+            silent = hist[p * N + i] == 0;
+        if (silent)
+            a->partial = p + 1; // nothing played then, or nothing captured: maybe missing
         memcpy(a->tbuf, a->prev, N * sizeof(float));
         memcpy(a->tbuf + N, hist + p * N, N * sizeof(float));
         memcpy(a->prev, hist + p * N, N * sizeof(float));
@@ -155,6 +164,8 @@ void aec_predict(aec* a, const float* ref, float* pred) {
     a->head = (a->head + 1) % P;
     float complex* x0 = a->X[a->head];
     memcpy(x0, a->fbuf, K * sizeof(float complex));
+    if (a->partial > 0)
+        a->partial--;
 
     float complex Y[K] = { 0 };
     for (int p = 0; p < P; p++) {
@@ -195,7 +206,9 @@ bool aec_update(aec* a, const float* err, bool learn) {
     // filter itself still learns from all of it.
     a->mp = SHARE_SMOOTH * a->mp + mp;
     a->pp = SHARE_SMOOTH * a->pp + pp;
-    a->share = a->pp > 0 && a->mp > 0 ? fminf(a->mp / a->pp, SHARE_MAX) : 0;
+    // Not past 1 while the speaker history has holes: the prediction then lacks the lags it
+    // doesn't have, and a share fitted to that remainder blows up once the history fills in.
+    a->share = a->pp > 0 && a->mp > 0 ? fminf(a->mp / a->pp, a->partial ? 1 : SHARE_MAX) : 0;
     if (!learn)
         return false; // holding still (being aligned, or the speakers silent): judge it later
     a->mic_pow = GUARD_SMOOTH * a->mic_pow + pm;

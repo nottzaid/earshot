@@ -167,14 +167,15 @@ static struct {
     struct spa_hook registry_listener, sink_listener;
     struct pw_proxy* sink;          // the output the speaker capture is linked to
     uint32_t sink_id;
-    struct { uint32_t id, out, in; } links[256]; // the graph's links, to find that output
+    struct { uint32_t id, out, in; } links[256]; // links into it, to find that output
     float sink_vol, sink_chan;      // its volume and mean channel volume
     bool sink_mute;
     bool streaming;                 // someone is listening to the mic
     atomic_int aec_want;            // AEC_OFF or AEC_RUN (set by the main thread)
     int aec_state;                  // RT copy
-    atomic_int aec_delay;           // filter's first lag, set by the main thread
-    atomic_bool aec_new_delay;
+    atomic_int aec_delay;           // filter's first lag: the RT thread's, once it runs
+    atomic_int aec_req_delay;       // where the main thread wants it
+    atomic_bool aec_new_delay;      // that is new
     atomic_bool aec_unsure;         // the delay may have moved: measure as soon as possible
     bool aec_refill;                // RT: rebuild the filter's speaker history at the next block
     bool aligning;                  // RT: finding how far the echo moved (the filter holds still)
@@ -189,6 +190,7 @@ static struct {
     int saved_lag;                  // bulk delay: the last measured, from this run or the last
     bool lag_measured;              // this run measured it: worth saving
     double saved_ppm;               // the clock ratio as loaded
+    bool saved_ppm_ok;              // one was (a file can hold only the lag)
     int aec_d;
     aec* aec;
     float ref_ring[RING], mic_ring[RING];
@@ -601,7 +603,6 @@ static void aec_move(int s) {
     }
     g.aec_d = d;
     atomic_store(&g.aec_delay, d);
-    atomic_store(&g.aec_new_delay, false);
     g.aec_refill = true;
     g.blk_start = -1;
 }
@@ -678,6 +679,8 @@ static inline float cancel(int64_t t, float mic) {
             g.align_e += e;
             g.blk_start = t;
             g.blk_learn = e > AEC_N * 1e-7f; // nothing to learn while the speakers are silent
+        } else {
+            g.aec_refill = true; // a block the filter's history skips: rebuild it when the speakers catch up
         }
     }
     if (g.blk_start < 0)
@@ -820,26 +823,27 @@ static void on_process(void* data) {
         if (g.aec_state == AEC_OFF) {
             g.aec_d = atomic_load(&g.aec_delay);
             aec_forget(g.aec);
-            g.aec_refill = true;
+            aec_move(0); // within where it may start now (the graph cycle may have grown)
             align_start(); // a new mic session: the echo may have moved
             g.aec_state = AEC_RUN;
             g.blk_start = -1;
         }
         if (atomic_exchange(&g.aec_new_delay, false)) {
-            int d = atomic_load(&g.aec_delay);
+            int d = atomic_load(&g.aec_req_delay);
             if ((d - g.aec_d) % AEC_N == 0) { // the main thread moves it in whole blocks
                 aec_shift(g.aec, (d - g.aec_d) / AEC_N);
                 g.aec_d = d;
+                atomic_store(&g.aec_delay, d);
                 g.aec_refill = true;
                 g.blk_start = -1;
-            } else { // measured before a cut moved it: measure again
-                atomic_store(&g.aec_delay, g.aec_d);
+            } else { // measured before a cut or an alignment moved it: measure again
                 atomic_store(&g.aec_unsure, true);
             }
         }
     }
     if (timed && T != atomic_load_explicit(&g.mic_end, memory_order_relaxed)) {
-        g.blk_start = -1; // the graph skipped or restarted: blocks realign on the next boundary
+        g.blk_start = -1; // the graph skipped or restarted: blocks realign on the next boundary,
+        g.aec_refill = true; // with the speaker history rebuilt for where they are now
         acq_restart(T);   // and the mic ring holds stale samples for the gap
     }
 
@@ -948,7 +952,7 @@ static void on_ref_process(void* data) {
         if (end == 0)
             end = T;
         const float* src = d->data ? (const float*)((uint8_t*)d->data + d->chunk->offset) : NULL;
-        for (int64_t t = end; t < T && T - t < RING; t++)
+        for (int64_t t = end > T - RING ? end : T - RING; t < T; t++)
             g.ref_ring[t & (RING - 1)] = 0; // a gap: nothing was played
         float gain = atomic_load_explicit(&g.ref_gain, memory_order_relaxed);
         for (uint32_t i = 0; i < n; i++)
@@ -1087,8 +1091,9 @@ static void on_global(void* data, uint32_t id, uint32_t perms, const char* type,
         return;
     const char* o = spa_dict_lookup(props, PW_KEY_LINK_OUTPUT_NODE);
     const char* in = spa_dict_lookup(props, PW_KEY_LINK_INPUT_NODE);
-    if (!o || !in)
-        return;
+    uint32_t me = g.ref_stream ? pw_stream_get_node_id(g.ref_stream) : SPA_ID_INVALID;
+    if (!o || !in || (me != SPA_ID_INVALID && (uint32_t)atoi(in) != me))
+        return; // only links into the speaker capture matter (all of them, until its id is known)
     for (size_t i = 0; i < SPA_N_ELEMENTS(g.links); i++)
         if (!g.links[i].id) {
             g.links[i].id = id;
@@ -1214,7 +1219,7 @@ static void aec_tick(void) {
     bool out = off < 240 || off > AEC_TAPS_MS * 48 - 4800 || d < min_start();
     if (to != d && out) {
         if (unsure || ++g.recheck_miss >= (off < 240 ? 1 : 2)) { // the direct sound outside the filter: now
-            atomic_store(&g.aec_delay, to);
+            atomic_store(&g.aec_req_delay, to);
             atomic_store(&g.aec_new_delay, true);
             g.recheck_miss = 0;
         }
@@ -1267,13 +1272,18 @@ static const struct pw_core_events core_events = {
 
 static void load_clock(void) {
     FILE* f = g.clock_path ? fopen(g.clock_path, "r") : NULL;
-    double ppm;
+    char tok[64];
     int lag;
     g.saved_lag = TYPICAL_LAG;
-    if (f && fscanf(f, "%lf", &ppm) == 1 && fabs(ppm) < CORR_MAX * 1e6) {
-        g.integ = ppm * 1e-6;
-        g.have_integ = true;
-        g.saved_ppm = ppm;
+    if (f && fscanf(f, "%63s", tok) == 1) { // the clock ratio in ppm, or "-" if never fitted
+        char* end;
+        double ppm = strtod(tok, &end);
+        if (end != tok && *end == 0 && isfinite(ppm) && fabs(ppm) < CORR_MAX * 1e6) {
+            g.integ = ppm * 1e-6;
+            g.have_integ = true;
+            g.saved_ppm = ppm;
+            g.saved_ppm_ok = true;
+        }
         if (fscanf(f, "%d", &lag) == 1 && lag > 0 && lag < MAX_LAG)
             g.saved_lag = lag;
     }
@@ -1292,7 +1302,10 @@ static void save_clock(void) {
     FILE* f = fopen(tmp, "w");
     if (!f)
         return;
-    fprintf(f, "%.4f\n%d\n", fitted ? atomic_load(&g.st_integ) * 1e6 : g.saved_ppm, g.saved_lag);
+    if (fitted || g.saved_ppm_ok)
+        fprintf(f, "%.4f\n%d\n", fitted ? atomic_load(&g.st_integ) * 1e6 : g.saved_ppm, g.saved_lag);
+    else
+        fprintf(f, "-\n%d\n", g.saved_lag); // a ratio never fitted is not 0 ppm
     if (fclose(f) == 0)
         rename(tmp, g.clock_path);
 }

@@ -106,9 +106,9 @@ played back through the same speakers:
   So the first ~85 ms of a session are matched against the filter's prediction, and the filter
   moves by the difference, to a fraction of a sample. At 7 kHz, where the speakers reach the phone
   loudest, one sample of error cancels almost nothing.
-- Only the least-squares share of the prediction that matches the mic is subtracted. A filter that
-  is stale or off can't make the output louder than the mic or feed the loop, and the filter
-  still learns from all of it.
+- Only the least-squares share of the prediction that matches the mic is subtracted, judged over
+  the last ~90 ms. A filter that is stale or off then can't make the output louder than the mic
+  (beyond a few milliseconds) or feed the loop, and the filter still learns from all of it.
 - The speaker capture is the mix before the output's volume, so the receiver scales it by that
   volume and mute. A volume change then isn't a new echo path to relearn.
 - Each new stream starts from the last echo path that cancelled well.
