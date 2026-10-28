@@ -170,6 +170,14 @@ int aec_find_delay(const float* ref, const float* mic, int n, int max_lag, float
             best = i;
     }
     float q = (float)(t[best] / (sum / max_lag + 1e-30));
+    // The direct sound comes first; a reflection or the farther speaker can still peak higher.
+    // Take the earliest peak within 6 dB of the highest and at most 15 ms before it.
+    for (int i = best > 720 ? best - 720 : 1; i < best; i++) {
+        if (t[i] >= 0.5f * t[best] && t[i] >= t[i - 1] && t[i] >= t[i + 1]) {
+            best = i;
+            break;
+        }
+    }
     if (confidence)
         *confidence = q;
     fftwf_destroy_plan(pr);

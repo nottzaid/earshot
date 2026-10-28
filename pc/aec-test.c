@@ -33,7 +33,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "bulk delay %d samples (%.3f ms), confidence %.1f\n", lag, lag / 48.0, q);
     if (lag < 0)
         return 1;
-    int D = lag - AEC_MARGIN;
+    int D = lag > AEC_MARGIN ? lag - AEC_MARGIN : 0;
     aec* a = aec_new();
     FILE* o = fopen(argv[2], "wb");
     float pred[AEC_N], err[AEC_N];

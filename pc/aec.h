@@ -4,8 +4,8 @@
 // through untouched.
 //
 // The prediction is a partitioned-block frequency-domain Kalman filter (Enzner & Vary 2006;
-// diagonalized as in Kuech et al. 2014) over 150 ms of echo path, after a bulk delay found by
-// GCC-PHAT. The Kalman step is large while the echo path is uncertain and small whenever the mic
+// diagonalized as in Kuech et al. 2014) over 170 ms of echo path, from 25 ms before a bulk delay
+// found by GCC-PHAT. The Kalman step is large while the echo path is uncertain and small whenever the mic
 // holds something the speakers can't explain (someone talking, the TV), so it does not learn
 // those or bend them.
 #pragma once
@@ -14,8 +14,9 @@
 #include <stdint.h>
 
 #define AEC_N 128                  // block length, samples
-#define AEC_TAPS_MS 150
-#define AEC_MARGIN 240             // filter starts 5 ms before the measured bulk delay
+#define AEC_TAPS_MS 170
+#define AEC_MARGIN 1200            // filter starts 25 ms before the measured bulk delay: an estimate
+                                   // that lands late must not leave the direct sound outside it
 
 typedef struct aec aec;
 

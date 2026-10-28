@@ -69,7 +69,9 @@
 #define RING (1 << 18)               // 5.4 s of speaker output and resampled mic
 #define ACQ_LEN (1 << 17)            // 2.7 s per delay measurement
 #define MAX_LAG 12000                // search up to 250 ms
-#define RECHECK_S 15
+#define RECHECK_S 5
+#define DUMP_MAX_S 180               // the dump's length (16 bytes a sample: 138 MB)
+#define DUMP_BACK 1024              // the dump's speaker column lags its mic column by this
 #define ZERO_RUN 32                  // this many exact zeros in a row: the mic is off or muted
 #define GAP_MIN 16                   // a hole of exact zeros this long or longer, but shorter
 #define GAP_MAX (RATE / 10)          // than this, is the decoder concealing a missing packet
@@ -101,7 +103,8 @@ static struct {
     const char* clock_path;
     const char* stats_path;
     int port;
-    int dump_fd;                    // debug: mic and output pairs, EARSHOT_RX_DUMP
+    int dump_fd;                    // debug: mic, output and speaker rows, EARSHOT_RX_DUMP
+    int64_t dump_left;              // samples still to write: the dump stops by itself
     int jitter_fd;                  // debug: each source packet's arrival, EARSHOT_RX_JITTER
 
     roc_context* roc;
@@ -160,6 +163,9 @@ static struct {
     aec* aec;
     float ref_ring[RING], mic_ring[RING];
     _Atomic int64_t ref_end, mic_end; // graph tick after the last sample written (mic's count)
+    _Atomic int64_t acq_from;       // first tick both rings hold under the current stream and mapping
+    atomic_int max_n;               // longest graph cycle seen, samples
+    atomic_int aec_lag;             // the last bulk delay measured (stats)
     // Each stream counts ticks from its own start, so the speaker stream's are mapped onto the
     // mic's through the cycle time both streams see.
     int64_t ref_now, ref_ticks;     // the speaker stream's last cycle
@@ -177,6 +183,7 @@ static struct {
 
     // published for the stats writer
     _Atomic double st_err, st_corr, st_integ;
+    atomic_bool st_fitted;          // this run measured the clock ratio itself: worth saving
     atomic_int st_state;            // 0 idle, 1 settling, 2 locked
     atomic_uint st_skips, st_windows, st_late, st_slow, st_gaps;
     atomic_uint st_gap_len, st_pop_fail; // the latest gap's length in samples; decoder pops that failed
@@ -533,6 +540,8 @@ static void end_window(void) {
         if (g.integ < -CORR_MAX)
             g.integ = -CORR_MAX;
         g.have_integ = true;
+        if (g.hist_n == REG_WINDOWS)
+            atomic_store(&g.st_fitted, true);
         if (g.hist_n == REG_WINDOWS && fabs(ratio - g.integ) < 2e-6)
             g.learned = true;
     }
@@ -586,6 +595,13 @@ static inline float cancel(int64_t t, float mic) {
     return out;
 }
 
+// The mic and speaker history from here on is all that a delay measurement may use; a measurement
+// already under way, of what came before, must not be applied.
+static void acq_restart(int64_t T) {
+    atomic_store(&g.acq_from, T);
+    atomic_store(&g.aec_new_delay, false);
+}
+
 static void on_process(void* data) {
     (void)data;
     int64_t t_in = now_ns();
@@ -604,6 +620,8 @@ static void on_process(void* data) {
         n = d->maxsize / sizeof(float);
     if (n > MAX_POP)
         n = MAX_POP;
+    if ((int)n > atomic_load_explicit(&g.max_n, memory_order_relaxed))
+        atomic_store_explicit(&g.max_n, (int)n, memory_order_relaxed);
     struct pw_time tm;
     bool timed = pw_stream_get_time_n(g.stream, &tm, sizeof(tm)) == 0 && tm.rate.denom == RATE;
     int64_t T = (int64_t)tm.ticks;
@@ -613,6 +631,7 @@ static void on_process(void* data) {
             g.tick_offset = off;          // first sight, or the speaker stream restarted
             g.offset_known = true;
             atomic_store(&g.ref_end, 0);  // what was written under the old mapping is unusable
+            acq_restart(T);
             if (g.aec_state == AEC_RUN)
                 g.aec_state = AEC_ACQUIRE;
         }
@@ -624,6 +643,8 @@ static void on_process(void* data) {
             g.to_retire = g.active; // a third epoch before the second is freed is not realistic
         g.active = fresh;
         reset_loop_state();
+        if (timed)
+            acq_restart(T); // the old stream's mic, at its old delay, can't be measured against
         if (g.aec_state == AEC_RUN)
             g.aec_state = AEC_ACQUIRE; // a new stream settles at a new delay
     }
@@ -646,8 +667,10 @@ static void on_process(void* data) {
             g.blk_start = -1;
         }
     }
-    if (timed && T != atomic_load_explicit(&g.mic_end, memory_order_relaxed))
+    if (timed && T != atomic_load_explicit(&g.mic_end, memory_order_relaxed)) {
         g.blk_start = -1; // the graph skipped or restarted: blocks realign on the next boundary
+        acq_restart(T);   // and the mic ring holds stale samples for the gap
+    }
 
     if (!g.active) {
         memset(dst, 0, n * sizeof(float));
@@ -656,6 +679,8 @@ static void on_process(void* data) {
         if (g.skip) {
             // Emergency cut: jump `skip` samples ahead, crossfading from the old position.
             g.pos += g.skip;
+            if (timed)
+                acq_restart(T);
             if (g.aec_state == AEC_RUN)
                 g.aec_state = AEC_ACQUIRE;
         }
@@ -708,14 +733,20 @@ static void on_process(void* data) {
     }
 
     atomic_store_explicit(&g.st_aec, g.aec_state, memory_order_relaxed);
-    if (g.dump_fd >= 0) { // debug: (mic, output) pairs
-        static float pairs[2 * MAX_POP];
+    if (g.dump_fd >= 0) { // debug: (mic, output, speakers DUMP_BACK ticks earlier, AEC state * 1e5 + delay)
+        static float rows[4 * MAX_POP];
+        int64_t ref_end = atomic_load_explicit(&g.ref_end, memory_order_acquire);
         for (uint32_t i = 0; i < n; i++) {
-            pairs[2 * i] = raw[i];
-            pairs[2 * i + 1] = dst[i];
+            int64_t t = T + i - DUMP_BACK;
+            rows[4 * i] = raw[i];
+            rows[4 * i + 1] = dst[i];
+            rows[4 * i + 2] = timed && t < ref_end && ref_end - t < RING ? g.ref_ring[t & (RING - 1)] : 0;
+            rows[4 * i + 3] = (float)(g.aec_state * 100000 + g.aec_d);
         }
-        if (write(g.dump_fd, pairs, 2 * n * sizeof(float)) < 0)
+        if (write(g.dump_fd, rows, 4 * n * sizeof(float)) < 0 || (g.dump_left -= n) <= 0) {
+            close(g.dump_fd);
             g.dump_fd = -1;
+        }
     }
     d->chunk->offset = 0;
     d->chunk->stride = sizeof(float);
@@ -826,8 +857,9 @@ static int measure_delay(void) {
     if (m < end)
         end = m;
     end -= 4096; // well behind what the RT thread is writing
-    if (end < ACQ_LEN)
-        return -1;
+    int64_t from = atomic_load(&g.acq_from);
+    if (end - ACQ_LEN < from)
+        return -1; // the window would mix in a delay that no longer holds: wait until it's all current
     double e = 0;
     for (int i = 0; i < ACQ_LEN; i++) {
         g.acq_ref[i] = g.ref_ring[(end - ACQ_LEN + i) & (RING - 1)];
@@ -838,8 +870,22 @@ static int measure_delay(void) {
         return -1; // the speakers were (nearly) silent: nothing to measure against
     float q;
     int lag = aec_find_delay(g.acq_ref, g.acq_mic, ACQ_LEN, MAX_LAG, &q);
-    return lag >= AEC_MARGIN ? lag : -1;
+    if (atomic_load(&g.acq_from) != from)
+        return -1; // the stream changed while measuring: what was measured no longer holds
+    if (lag >= 0)
+        atomic_store(&g.aec_lag, lag);
+    return lag;
 }
+
+// Where the filter starts, behind the mic. Never so close that the speaker sound for a block
+// might not have been captured yet: the speaker stream can run after the mic's in a graph cycle,
+// so the last block of a cycle needs the filter at least a cycle behind.
+static int min_start(void) {
+    int n = atomic_load(&g.max_n) + AEC_N;
+    return n > 512 ? n : 512;
+}
+
+static int filter_start(int lag) { return lag - AEC_MARGIN > min_start() ? lag - AEC_MARGIN : min_start(); }
 
 static void aec_tick(void) {
     if (atomic_load(&g.aec_want) == AEC_OFF || !g.streaming)
@@ -848,7 +894,7 @@ static void aec_tick(void) {
     if (state == AEC_ACQUIRE) {
         int lag = measure_delay();
         if (lag >= 0) {
-            atomic_store(&g.aec_delay, lag - AEC_MARGIN);
+            atomic_store(&g.aec_delay, filter_start(lag));
             atomic_store(&g.aec_new_delay, true);
             g.recheck_in = RECHECK_S;
             g.recheck_miss = 0;
@@ -856,10 +902,14 @@ static void aec_tick(void) {
     } else if (state == AEC_RUN && --g.recheck_in <= 0) {
         // The delay holds still, but a cut or a pull of the queue can move it: follow.
         g.recheck_in = RECHECK_S;
-        int lag = measure_delay();
-        if (lag >= 0 && abs(lag - AEC_MARGIN - atomic_load(&g.aec_delay)) > 96) {
-            if (++g.recheck_miss >= 2) {
-                atomic_store(&g.aec_delay, lag - AEC_MARGIN);
+        // The filter covers the drift of a few samples a minute and any small shift by itself;
+        // restarting it costs seconds of echo, so only do that when the direct sound nears its
+        // start, leaves it less than 100 ms of tail, or the graph cycle outgrew the start.
+        int d = atomic_load(&g.aec_delay), lag = measure_delay(), off = lag - d;
+        bool out = off < 240 || off > AEC_TAPS_MS * 48 - 4800 || d < min_start();
+        if (lag >= 0 && filter_start(lag) != d && out) {
+            if (++g.recheck_miss >= (off < 240 ? 1 : 2)) { // the direct sound outside the filter: now
+                atomic_store(&g.aec_delay, filter_start(lag));
                 atomic_store(&g.aec_new_delay, true);
                 g.recheck_miss = 0;
             }
@@ -925,8 +975,8 @@ static void load_clock(void) {
 }
 
 static void save_clock(void) {
-    if (!g.clock_path || !g.have_integ)
-        return;
+    if (!g.clock_path || !atomic_load(&g.st_fitted))
+        return; // a run that never measured the clock (no stream, or too short) keeps the saved one
     char tmp[4096];
     snprintf(tmp, sizeof(tmp), "%s.tmp", g.clock_path);
     FILE* f = fopen(tmp, "w");
@@ -950,7 +1000,7 @@ static void on_tick(void* data, uint64_t expirations) {
                     atomic_load(&g.st_corr) * 1e6, atomic_load(&g.st_integ) * 1e6,
                     atomic_load(&g.st_skips), atomic_load(&g.st_gaps),
                     atomic_load(&g.st_late), atomic_load(&g.st_slow), (double)atomic_load(&g.st_max_ns) / 1e3,
-                    atomic_load(&g.st_aec), atomic_load(&g.aec_delay) + AEC_MARGIN, atomic_load(&g.st_erle),
+                    atomic_load(&g.st_aec), atomic_load(&g.aec_lag), atomic_load(&g.st_erle),
                     (long long)(atomic_load(&g.mic_end) - atomic_load(&g.ref_end)), atomic_load(&g.st_gap_len),
                     atomic_load(&g.st_pop_fail));
             fclose(f);
@@ -996,6 +1046,7 @@ int main(int argc, char** argv) {
     load_clock();
     const char* dump = getenv("EARSHOT_RX_DUMP");
     g.dump_fd = dump ? open(dump, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644) : -1;
+    g.dump_left = (int64_t)DUMP_MAX_S * RATE;
     const char* jitter = getenv("EARSHOT_RX_JITTER");
     g.jitter_fd = jitter ? open(jitter, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644) : -1;
     g.step = 1.0 + g.integ;

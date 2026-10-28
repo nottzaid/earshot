@@ -92,8 +92,9 @@ output plays, on the same graph clock as the mic, and subtracts what that sound 
 phone's mic. It is subtraction only: the output is the mic minus a linear prediction of the
 speaker sound, with no suppressor, gate, noise reduction or level change, so voices, a TV and
 the room come through as captured. The prediction is a frequency-domain Kalman filter over
-150 ms of echo path (`pc/aec.c`), after a bulk delay found by GCC-PHAT and rechecked every
-15 s. It adds no latency: the speaker sound reaches the mic ~60 ms after it is played, so the
+170 ms of echo path (`pc/aec.c`), starting 25 ms before a bulk delay found by GCC-PHAT (the
+earliest strong arrival, so the direct sound is never left outside the filter) and rechecked
+every 5 s. It adds no latency: the speaker sound reaches the mic 40-50 ms after it is played, so the
 prediction is ready before the mic samples arrive.
 
 Measured on music through the PC speakers with a TV on in the room: 17-22 dB less speaker
