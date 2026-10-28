@@ -798,7 +798,7 @@ static void ref_connect(void) {
         PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Capture", PW_KEY_MEDIA_ROLE, "DSP",
         PW_KEY_STREAM_CAPTURE_SINK, "true", // the default output, following it when it changes
         PW_KEY_NODE_GROUP, "earshot",        // scheduled with the mic, on the same clock
-        PW_KEY_NODE_LATENCY, "128/48000", PW_KEY_NODE_RATE, "1/48000", NULL);
+        PW_KEY_NODE_LATENCY, "256/48000", PW_KEY_NODE_RATE, "1/48000", NULL);
     g.ref_stream = pw_stream_new(g.core, "Earshot speakers", props);
     if (!g.ref_stream)
         return;
@@ -1041,7 +1041,7 @@ int main(int argc, char** argv) {
 
     struct pw_properties* props = pw_properties_new(
         PW_KEY_NODE_NAME, g.node, PW_KEY_NODE_DESCRIPTION, g.description,
-        PW_KEY_MEDIA_CLASS, "Audio/Source", PW_KEY_NODE_LATENCY, "128/48000",
+        PW_KEY_MEDIA_CLASS, "Audio/Source", PW_KEY_NODE_LATENCY, "256/48000",
         PW_KEY_NODE_RATE, "1/48000", PW_KEY_DEVICE_ICON_NAME, "phone",
         PW_KEY_NODE_GROUP, "earshot",
         // never become the default mic on its own; only when the phone asks
