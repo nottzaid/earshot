@@ -73,6 +73,7 @@
 #define MAX_LAG 12000                // search up to 250 ms
 #define RECHECK_S 5
 #define ALIGN_MIN_ECHO 1e-7f         // mean square of the expected echo worth aligning on (-70 dBFS)
+#define ALIGN_TRIES 12               // windows to try before giving up on a match (~1 s)
 #define TYPICAL_LAG 2000             // speaker sound reaches the phone's mic ~40 ms after playing
 #define DUMP_MAX_S 180               // the dump's length (16 bytes a sample: 138 MB)
 #define DUMP_BACK 1024              // the dump's speaker column lags its mic column by this
@@ -176,8 +177,9 @@ static struct {
     atomic_bool aec_new_delay;
     atomic_bool aec_unsure;         // the delay may have moved: measure as soon as possible
     bool aec_refill;                // RT: rebuild the filter's speaker history at the next block
-    bool aligning;                  // RT: finding how far the echo moved before subtracting again
+    bool aligning;                  // RT: finding how far the echo moved (the filter holds still)
     int align_n, align_wait;        // samples in the window; of speaker sound waited through
+    int align_tries;                // windows that matched nothing
     float align_e;                  // speaker power over the alignment window
     float align_mic[AEC_ALIGN], align_pred[AEC_ALIGN];
     atomic_bool snap_req, snap_ready; // the echo path, copied out at a block boundary to be saved
@@ -613,6 +615,7 @@ static void align_start(void) {
     g.aligning = aec_knows_path(g.aec);
     g.align_n = 0;
     g.align_wait = 0;
+    g.align_tries = 0;
     g.align_e = 0;
 }
 
@@ -634,8 +637,12 @@ static void align_done(void) {
     // wait for a window with some, but not past 2 s of sound.
     if (pp < AEC_ALIGN * ALIGN_MIN_ECHO && (!playing || (g.align_wait += AEC_ALIGN) < 2 * RATE))
         return;
-    g.aligning = false;
     int s = aec_align(g.aec, g.align_pred, g.align_mic);
+    // No match yet: the room drowned the echo out, or the filter is that far off. Try the next
+    // windows: if the echo is building up round the loop, it soon stands out.
+    if (s == AEC_NO_SHIFT && ++g.align_tries < ALIGN_TRIES)
+        return;
+    g.aligning = false;
     if (s != AEC_NO_SHIFT)
         aec_move(s);
     else

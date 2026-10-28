@@ -97,6 +97,22 @@ earliest strong arrival, so the direct sound is never left outside the filter) a
 every 5 s. It adds no latency: the speaker sound reaches the mic 40-50 ms after it is played, so the
 prediction is ready before the mic samples arrive.
 
+It has to hold up with the loop closed, as in a voice app's mic test, where the cleaned mic is
+played back through the same speakers:
+
+- It subtracts from the first sample, with the echo path learned last time
+  (`~/.local/state/earshot/clock.echo`), and keeps what it learned through dropouts.
+- Each mic session puts the echo a little earlier or later (the phone's capture latency varies).
+  So the first ~85 ms of a session are matched against the filter's prediction, and the filter
+  moves by the difference, to a fraction of a sample. At 7 kHz, where the speakers reach the phone
+  loudest, one sample of error cancels almost nothing.
+- Only the least-squares share of the prediction that matches the mic is subtracted. A filter that
+  is stale or off can't make the output louder than the mic or feed the loop, and the filter
+  still learns from all of it.
+- The speaker capture is the mix before the output's volume, so the receiver scales it by that
+  volume and mute. A volume change then isn't a new echo path to relearn.
+- Each new stream starts from the last echo path that cancelled well.
+
 Measured on music through the PC speakers with a TV on in the room: 17-22 dB less speaker
 sound in the mic once settled (a few seconds), the TV's sound unchanged. A voice mixed into the
 mic digitally came out within 0.3 dB of itself. Sound the PC doesn't play (phone notifications,
