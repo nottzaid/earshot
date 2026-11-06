@@ -80,6 +80,13 @@
 #define ZERO_RUN 32                  // this many exact zeros in a row: the mic is off or muted
 #define GAP_MIN 16                   // a hole of exact zeros this long or longer, but shorter
 #define GAP_MAX (RATE / 10)          // than this, is the decoder concealing a missing packet
+// Roc's RTP filter rejects a packet more than 100 seqnums or 1 s from the last one it took, and
+// never moves on from it: one long hole (the phone sheds its backlog when the radio stalls) would
+// silence the stream for good. A jump past these starts a fresh decoder instead, as a new SSRC
+// does; a packet this far behind the newest is too late to play and must not reach the filter.
+#define SEQ_JUMP 64
+#define TS_JUMP (RATE / 2)
+#define SEQ_BACK 32
 
 enum { AEC_OFF, AEC_ACQUIRE, AEC_RUN }; // ACQUIRE: no longer used (a filter that waited for a measurement)
 
@@ -307,7 +314,15 @@ static void on_source_packet(const uint8_t* p, size_t n) {
     uint32_t ssrc = (uint32_t)p[8] << 24 | (uint32_t)p[9] << 16 | (uint32_t)p[10] << 8 | p[11];
 
     struct epoch* e = g.net_cur;
-    if (!e || e->ssrc != ssrc) {
+    int sn = 0;
+    bool jump = false;
+    if (e && e->ssrc == ssrc) {
+        sn = (int16_t)(seq - e->last_seq);
+        if (sn < -SEQ_BACK)
+            return;
+        jump = sn > SEQ_JUMP || (int32_t)(ts - e->last_ts) > TS_JUMP;
+    }
+    if (!e || e->ssrc != ssrc || jump) {
         struct epoch* fresh = epoch_open(ssrc);
         if (!fresh)
             return;
@@ -316,7 +331,10 @@ static void on_source_packet(const uint8_t* p, size_t n) {
         // Whichever of us takes a pending epoch owns it; an unadopted one is ours to free.
         epoch_close(atomic_exchange(&g.pending, fresh));
         g.net_cur = e = fresh;
-        fprintf(stderr, "stream %08x started\n", ssrc);
+        if (jump)
+            fprintf(stderr, "stream %08x resumed after %d missing packets\n", ssrc, sn - 1);
+        else
+            fprintf(stderr, "stream %08x started\n", ssrc);
     }
 
     int64_t ext = e->last_ext + (int32_t)(ts - e->last_ts);
